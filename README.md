@@ -37,17 +37,23 @@ imports fine (for protocol/unit tests) without a GPU.
 
 ## Run
 
+With a **pip-installed** Isaac Lab (Windows / Linux) there is no `isaaclab.sh` —
+the bridge launches Isaac Sim itself, so run it with plain python via the
+`ssr-arm-bridge` entry point (equivalently `python -m ssr_robotics.run_bridge`).
+
 ```bash
-# 1) brain machine — bus server (the SSR process auto-starts one, or run):
-ssr bus serve --host 0.0.0.0 --port 8765
+# 1) bus server (any machine; the SSR process also auto-starts an embedded one):
+ssr bus serve --host 127.0.0.1 --port 8765
 
-# 2) GPU machine — the bridge (launch via Isaac's python; cameras auto-enabled):
-./isaaclab.sh -p scripts/ssr_bridge/run_openarm_bridge.py \
-   --bus ws://<brain-host>:8765 --task Isaac-Manip-OpenArm-v0 --headless
+# 2) the bridge — pip Isaac Lab: plain python entry point
+ssr-arm-bridge --bus ws://127.0.0.1:8765 --task Isaac-Manip-OpenArm-v0
+#    source (git) Isaac Lab instead: ./isaaclab.sh -p .../run_openarm_bridge.py ...
 
-# 3) brain machine — drive a natural-language instruction:
-ssr arm do "把苹果放到橘子上" --bus-url ws://<brain-host>:8765
+# 3) drive a natural-language instruction (needs GEMINI_API_KEY):
+ssr arm do "把苹果放到橘子上" --bus-url ws://127.0.0.1:8765
 ```
+
+Start order: **bus server → bridge → `ssr arm do`**.
 
 ## Tests (no GPU)
 
