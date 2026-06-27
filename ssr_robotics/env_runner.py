@@ -58,33 +58,46 @@ class EnvRunner:
         self.bus.publish(topic, payload)
 
     def _frame_fields(self) -> dict:
-        return {
-            "frame_b64": base64.b64encode(self.env.frame()).decode("ascii"),
-            "camera": {"width": self.env.CAM_W, "height": self.env.CAM_H},
-        }
+        # The TiledCamera's render buffer can be momentarily empty right after a
+        # reset (before the next step ticks the render pipeline) — don't let a
+        # camera hiccup take down the whole state/completion report with it.
+        try:
+            return {
+                "frame_b64": base64.b64encode(self.env.frame()).decode("ascii"),
+                "camera": {"width": self.env.CAM_W, "height": self.env.CAM_H},
+            }
+        except Exception as e:
+            print(f"[env_runner] frame capture failed: {e}")
+            return {"camera": {"width": self.env.CAM_W, "height": self.env.CAM_H}}
 
     def _publish_caps(self) -> None:
         try:
             with self._lock:
                 caps = self.env.capabilities()
             self._publish(P.TOPIC_CAPS, caps)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[env_runner] capabilities publish failed: {e}")
 
     # ------------------------------------------------------------- handlers
     def _on_caps(self, ev) -> None:
         self._publish_caps()
 
     def _on_reset(self, ev) -> None:
-        with self._lock:
-            self.env.reset()
-            snap = self.env.metrics()
-        self._publish(P.TOPIC_STATE, {**snap, **self._frame_fields()})
+        try:
+            with self._lock:
+                self.env.reset()
+                snap = self.env.metrics()
+            self._publish(P.TOPIC_STATE, {**snap, **self._frame_fields()})
+        except Exception as e:
+            print(f"[env_runner] reset failed: {e}")
 
     def _on_state_request(self, ev) -> None:
-        with self._lock:
-            snap = self.env.metrics()
-        self._publish(P.TOPIC_STATE, {**snap, **self._frame_fields()})
+        try:
+            with self._lock:
+                snap = self.env.metrics()
+            self._publish(P.TOPIC_STATE, {**snap, **self._frame_fields()})
+        except Exception as e:
+            print(f"[env_runner] state request failed: {e}")
 
     def _on_execute(self, ev) -> None:
         req = P.ArmActionRequest.from_payload(ev.payload)
