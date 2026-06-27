@@ -39,6 +39,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
     args = parser.parse_args(argv)
+    # The manip env's TiledCamera requires the cameras pipeline.
+    args.enable_cameras = True
 
     # 1. Launch the Isaac Sim app FIRST.
     from isaaclab.app import AppLauncher
