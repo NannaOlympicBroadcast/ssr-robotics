@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssr-robotics"
+version = "0.1.0"
+description = "Env-side bridge connecting an Isaac Lab OpenArm to the SSR Agent event bus."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "SSR Robotics" }]
+keywords = ["robotics", "isaac-lab", "openarm", "ssr-agent", "event-bus"]
+
+# `ssr-agent` is a required peer (provides ssr.bus + the shared
+# ssr.robotics.protocol). Install it alongside, e.g. `pip install -e ../ssr-agent`.
+# Isaac Sim / isaaclab / torch are provided by the Isaac Lab environment itself
+# and are imported lazily, so they are listed under the `isaac` extra only.
+dependencies = [
+  "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+isaac = ["gymnasium>=0.29", "numpy>=1.24", "pillow>=10.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+ssr-arm-bridge = "ssr_robotics.run_bridge:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ssr_robotics*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
