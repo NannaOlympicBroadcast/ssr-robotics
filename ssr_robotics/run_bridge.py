@@ -32,8 +32,9 @@ def main(argv: list[str] | None = None) -> int:
     # Ctrl-Break dumps every thread's Python stack to stderr without killing the
     # process — the only way to see where this is stuck when it's hung in our own
     # code (Kit/physx is a native process py-spy can't introspect on Windows).
+    # faulthandler.register() itself is Unix-only, so wire SIGBREAK by hand.
     if hasattr(signal, "SIGBREAK"):
-        faulthandler.register(signal.SIGBREAK)
+        signal.signal(signal.SIGBREAK, lambda signum, frame: faulthandler.dump_traceback())
 
     parser = argparse.ArgumentParser(prog="ssr-arm-bridge", description=__doc__)
     parser.add_argument("--bus", required=True, help="ws:// URL of the SSR bus server")
