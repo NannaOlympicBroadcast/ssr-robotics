@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import threading
+import traceback
 
 from . import protocol as P
 
@@ -57,6 +58,12 @@ class EnvRunner:
     def _publish(self, topic: str, payload: dict) -> None:
         self.bus.publish(topic, payload)
 
+    @staticmethod
+    def _log_exc(label: str) -> None:
+        # Some exceptions (asyncio/bare TimeoutError, etc.) stringify to '' —
+        # print the type + traceback too, or failures are silently uninformative.
+        print(f"[env_runner] {label} failed:\n{traceback.format_exc()}")
+
     def _frame_fields(self) -> dict:
         # The TiledCamera's render buffer can be momentarily empty right after a
         # reset (before the next step ticks the render pipeline) — don't let a
@@ -66,8 +73,8 @@ class EnvRunner:
                 "frame_b64": base64.b64encode(self.env.frame()).decode("ascii"),
                 "camera": {"width": self.env.CAM_W, "height": self.env.CAM_H},
             }
-        except Exception as e:
-            print(f"[env_runner] frame capture failed: {e}")
+        except Exception:
+            self._log_exc("frame capture")
             return {"camera": {"width": self.env.CAM_W, "height": self.env.CAM_H}}
 
     def _publish_caps(self) -> None:
@@ -75,8 +82,8 @@ class EnvRunner:
             with self._lock:
                 caps = self.env.capabilities()
             self._publish(P.TOPIC_CAPS, caps)
-        except Exception as e:
-            print(f"[env_runner] capabilities publish failed: {e}")
+        except Exception:
+            self._log_exc("capabilities publish")
 
     # ------------------------------------------------------------- handlers
     def _on_caps(self, ev) -> None:
@@ -88,16 +95,16 @@ class EnvRunner:
                 self.env.reset()
                 snap = self.env.metrics()
             self._publish(P.TOPIC_STATE, {**snap, **self._frame_fields()})
-        except Exception as e:
-            print(f"[env_runner] reset failed: {e}")
+        except Exception:
+            self._log_exc("reset")
 
     def _on_state_request(self, ev) -> None:
         try:
             with self._lock:
                 snap = self.env.metrics()
             self._publish(P.TOPIC_STATE, {**snap, **self._frame_fields()})
-        except Exception as e:
-            print(f"[env_runner] state request failed: {e}")
+        except Exception:
+            self._log_exc("state request")
 
     def _on_execute(self, ev) -> None:
         req = P.ArmActionRequest.from_payload(ev.payload)
