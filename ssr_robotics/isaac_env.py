@@ -51,19 +51,25 @@ LIFT_Z = 0.25       # height to lift to after grasping (m)
 
 class IsaacOpenArmEnv:
     def __init__(self, task: str = "Isaac-Manip-OpenArm-v0", steps_per_move: int = 30,
-                 settle_steps: int = 15):
+                 settle_steps: int = 15, num_envs: int = 1):
         import gymnasium as gym
         import torch
 
         import openarm.tasks  # noqa: F401  registers the gym ids
         from isaaclab.utils.math import subtract_frame_transforms
+        from isaaclab_tasks.utils import parse_env_cfg
 
         self.torch = torch
         self._sub = subtract_frame_transforms
         self.task = task
         self.steps_per_move = steps_per_move
         self.settle_steps = settle_steps
-        self.env = gym.make(task, render_mode="rgb_array")
+        # The `env_cfg_entry_point` gym.make() is registered with is inert metadata —
+        # Isaac Lab requires resolving it into a real cfg instance first. This also
+        # forces num_envs=1: the task's registered default is RL-training scale
+        # (e.g. 4096), but this bridge drives a single real/simulated arm.
+        env_cfg = parse_env_cfg(task, num_envs=num_envs)
+        self.env = gym.make(task, cfg=env_cfg, render_mode="rgb_array")
         self.device = self.env.unwrapped.device
         cam = self.env.unwrapped.scene["tiled_camera"]
         self.CAM_H, self.CAM_W = int(cam.image_shape[0]), int(cam.image_shape[1])
