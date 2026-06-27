@@ -7,21 +7,32 @@ in-process :class:`ssr.bus.core.MessageBus` and the remote
 
 * answers ``arm.capabilities.request`` with the env's advertised capabilities
   (so the agent discovers the supported action types / skills at runtime);
-* serves ``arm.action.execute`` by invoking the requested skill on the env in a
-  worker thread (so a long motion never blocks the bus), then publishes a
-  completion event (``arm.grasp.completed`` for grasping skills, else
-  ``arm.action.completed``) carrying the result + scene snapshot + camera frame.
+* serves ``arm.action.execute`` by invoking the requested skill on the env, then
+  publishes a completion event (``arm.grasp.completed`` for grasping skills,
+  else ``arm.action.completed``) carrying the result + scene snapshot + camera
+  frame.
 
 The env must implement: ``reset()``, ``execute(req) -> dict``,
 ``metrics() -> dict``, ``capabilities() -> dict``, ``frame() -> bytes`` and the
 ``CAM_W`` / ``CAM_H`` attributes (see :class:`~ssr_robotics.isaac_env.IsaacOpenArmEnv`).
+
+Bus events normally arrive on a background thread (the remote
+:class:`ssr.bus.client.BusClient` pumps callbacks from its own asyncio loop
+thread). Isaac Sim / Omniverse Kit's simulation context, PhysX and renderer are
+**not** thread-safe and may only be driven from the thread that owns
+``simulation_app`` — calling ``env.step()``/``env.reset()`` off that thread is a
+reliable way to freeze or hang the app. So bus-callback handlers never touch
+``self.env`` directly: they enqueue a job and return immediately (keeping the
+bus responsive), and the owner of ``simulation_app`` drains the queue by calling
+:meth:`pump` in its main loop, running every env call on the correct thread.
 """
 
 from __future__ import annotations
 
 import base64
-import threading
+import queue
 import traceback
+from typing import Callable
 
 from . import protocol as P
 
@@ -35,14 +46,15 @@ class EnvRunner:
         self.env = env
         self.source = source
         self._subs: list = []
-        self._lock = threading.Lock()  # serialize env stepping (single sim)
+        self._jobs: "queue.Queue[Callable[[], None]]" = queue.Queue()
 
     def start(self) -> "EnvRunner":
         self._subs.append(self.bus.subscribe(P.TOPIC_CAPS_REQUEST, self._on_caps))
         self._subs.append(self.bus.subscribe(P.TOPIC_ACTION_EXECUTE, self._on_execute))
         self._subs.append(self.bus.subscribe(P.TOPIC_RESET, self._on_reset))
         self._subs.append(self.bus.subscribe(P.TOPIC_STATE_REQUEST, self._on_state_request))
-        # Advertise capabilities once on startup too.
+        # Advertise capabilities once on startup too. start() is called from the
+        # main/sim thread before the event loop begins, so this direct call is safe.
         self._publish_caps()
         return self
 
@@ -53,6 +65,19 @@ class EnvRunner:
             except Exception:
                 pass
         self._subs.clear()
+
+    def pump(self, timeout: float = 0.0) -> bool:
+        """Run at most one queued env job. Call this from the thread that owns
+        ``simulation_app``, in its main loop. Returns ``True`` if a job ran."""
+        try:
+            job = self._jobs.get(timeout=timeout)
+        except queue.Empty:
+            return False
+        try:
+            job()
+        except Exception:
+            self._log_exc("queued env job")
+        return True
 
     # ----------------------------------------------------------- publishing
     def _publish(self, topic: str, payload: dict) -> None:
@@ -79,47 +104,55 @@ class EnvRunner:
 
     def _publish_caps(self) -> None:
         try:
-            with self._lock:
-                caps = self.env.capabilities()
+            caps = self.env.capabilities()
             self._publish(P.TOPIC_CAPS, caps)
         except Exception:
             self._log_exc("capabilities publish")
 
     # ------------------------------------------------------------- handlers
+    # These run on a bus-callback thread, never the sim thread: they only ever
+    # enqueue a job (cheap, non-blocking) for pump() to run on the right thread.
     def _on_caps(self, ev) -> None:
-        self._publish_caps()
+        self._jobs.put(self._publish_caps)
 
     def _on_reset(self, ev) -> None:
-        try:
-            with self._lock:
+        def _job() -> None:
+            try:
                 self.env.reset()
                 snap = self.env.metrics()
-            self._publish(P.TOPIC_STATE, {**snap, **self._frame_fields()})
-        except Exception:
-            self._log_exc("reset")
+                self._publish(P.TOPIC_STATE, {**snap, **self._frame_fields()})
+            except Exception:
+                self._log_exc("reset")
+
+        self._jobs.put(_job)
 
     def _on_state_request(self, ev) -> None:
-        try:
-            with self._lock:
+        def _job() -> None:
+            try:
                 snap = self.env.metrics()
-            self._publish(P.TOPIC_STATE, {**snap, **self._frame_fields()})
-        except Exception:
-            self._log_exc("state request")
+                self._publish(P.TOPIC_STATE, {**snap, **self._frame_fields()})
+            except Exception:
+                self._log_exc("state request")
+
+        self._jobs.put(_job)
 
     def _on_execute(self, ev) -> None:
         req = P.ArmActionRequest.from_payload(ev.payload)
 
-        def _run() -> None:
-            with self._lock:
+        def _job() -> None:
+            try:
                 result = self.env.execute(req)
                 frame = self._frame_fields()
+            except Exception:
+                self._log_exc("execute")
+                return
             payload = {"seq_id": req.seq_id, "episode": req.episode,
                        "status": "settled", **result, **frame}
             topic = (P.TOPIC_GRASP_COMPLETED if req.command in _GRASPING
                      else P.TOPIC_ACTION_COMPLETED)
             self._publish(topic, payload)
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._jobs.put(_job)
 
 
 def connect_remote(url: str, source: str = "openarm-env", api_key: str | None = None):

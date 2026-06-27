@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import faulthandler
 import signal
-import time
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -68,8 +67,15 @@ def main(argv: list[str] | None = None) -> int:
           "Serving arm.action.execute … (Ctrl-C to stop)")
 
     try:
+        # Isaac Sim's sim/render context is not thread-safe and must only be
+        # driven from this thread. Bus callbacks run on a different thread (the
+        # remote BusClient's own asyncio loop) and only enqueue work; draining it
+        # here, on simulation_app's own thread, is what actually steps the env.
+        # When idle, poll simulation_app.update() so the app stays responsive
+        # (otherwise Kit's UI/render loop never gets pumped and looks frozen).
         while simulation_app.is_running():
-            time.sleep(0.1)
+            if not runner.pump(timeout=0.1):
+                simulation_app.update()
     except KeyboardInterrupt:
         pass
     finally:

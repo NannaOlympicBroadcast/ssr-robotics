@@ -76,8 +76,53 @@ def test_runner_serves_skill_and_reports_completion():
     bus.subscribe(P.TOPIC_GRASP_COMPLETED, lambda ev: (out.update(p=ev.payload), done.set()))
     req = P.ArmActionRequest(seq_id="", episode=1, command="pick", args={"object": "apple"})
     bus.publish(P.TOPIC_ACTION_EXECUTE, req.to_payload())
+    # The bus handler only enqueues; pump() (the sim thread's job) runs it.
+    assert runner.pump(timeout=2.0)
     assert done.wait(3.0)
     runner.stop()
     assert out["p"]["ok"] is True and out["p"]["holding"] == "apple"
     assert out["p"]["camera"] == {"width": 8, "height": 4}
     assert base64.b64decode(out["p"]["frame_b64"]).startswith(b"\x89PNG")
+
+
+def test_env_only_touched_from_pump_thread():
+    """The bug this guards against: Isaac Sim's sim/render context is not
+    thread-safe and may only be driven from the thread that owns
+    ``simulation_app``. Bus callbacks run on whatever thread the transport uses
+    (a remote BusClient's own asyncio loop thread, not that thread) -- they must
+    only enqueue a job, never call into the env directly. ``pump()`` is the sole
+    place env methods may run.
+    """
+    bus = MessageBus(name="t", source="t")
+    env = _StubEnv()
+    runner = EnvRunner(bus, env).start()
+
+    publish_thread_id = threading.get_ident()
+    call_thread_ids = []
+    orig_execute = env.execute
+
+    def _tracking_execute(req):
+        call_thread_ids.append(threading.get_ident())
+        return orig_execute(req)
+
+    env.execute = _tracking_execute
+
+    req = P.ArmActionRequest(seq_id="", episode=1, command="pick", args={"object": "apple"})
+    bus.publish(P.TOPIC_ACTION_EXECUTE, req.to_payload())
+    # publish() dispatches the handler synchronously on this thread, but the
+    # handler must only enqueue a job -- the env itself stays untouched so far.
+    assert call_thread_ids == []
+
+    pump_thread_id = {}
+
+    def _sim_thread():
+        pump_thread_id["id"] = threading.get_ident()
+        runner.pump(timeout=3.0)
+
+    t = threading.Thread(target=_sim_thread)
+    t.start()
+    t.join(5.0)
+    runner.stop()
+
+    assert call_thread_ids == [pump_thread_id["id"]]
+    assert pump_thread_id["id"] != publish_thread_id
