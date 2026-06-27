@@ -23,10 +23,18 @@ all Isaac imports happen inside :func:`main` after ``AppLauncher``.
 from __future__ import annotations
 
 import argparse
+import faulthandler
+import signal
 import time
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Ctrl-Break dumps every thread's Python stack to stderr without killing the
+    # process — the only way to see where this is stuck when it's hung in our own
+    # code (Kit/physx is a native process py-spy can't introspect on Windows).
+    if hasattr(signal, "SIGBREAK"):
+        faulthandler.register(signal.SIGBREAK)
+
     parser = argparse.ArgumentParser(prog="ssr-arm-bridge", description=__doc__)
     parser.add_argument("--bus", required=True, help="ws:// URL of the SSR bus server")
     parser.add_argument("--api-key", default=None, help="bus API key, if required")
