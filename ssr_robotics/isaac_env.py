@@ -45,7 +45,11 @@ SKILLS = [
 GRASP_QUAT = (0.0, 1.0, 0.0, 0.0)
 
 APPROACH_Z = 0.12   # hover height above an object before descending (m)
-GRASP_Z = 0.02      # TCP height above the object centre when closing (m)
+# TCP height relative to the object centre when closing (m). The graspable
+# objects are spheres, so their centre *is* the equator (max cross-section) —
+# closing above it (the previous +0.02) grips the narrowing upper hemisphere
+# and the ball pops out on lift. Close at the equator instead.
+GRASP_Z = 0.0
 LIFT_Z = 0.25       # height to lift to after grasping (m)
 
 
