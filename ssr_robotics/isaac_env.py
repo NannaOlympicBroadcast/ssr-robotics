@@ -20,6 +20,8 @@ constructing this class — see ``run_bridge.py`` / ``openarm_isaac_lab/scripts`
 
 from __future__ import annotations
 
+import math
+
 from . import protocol as P
 
 # Maps scene rigid-object keys to friendly names the agent sees. Mirrors
@@ -141,7 +143,12 @@ class IsaacOpenArmEnv:
         cmd, args = req.command, req.args
         if cmd == "raw":
             t = self.torch
-            for vec in req.actions:
+            dof = int(self.env.unwrapped.action_manager.total_action_dim)
+            for i, vec in enumerate(req.actions):
+                if len(vec) != dof:
+                    raise ValueError(f"raw action[{i}] has {len(vec)} dims, expected {dof}")
+                if not all(math.isfinite(v) for v in vec):
+                    raise ValueError(f"raw action[{i}] has a non-finite value: {vec}")
                 a = t.tensor([vec] * self._num, dtype=t.float32, device=self.device)
                 self.env.step(a)
             return True
