@@ -6,15 +6,19 @@ to the SSR bus server and serves ``arm.action.execute`` requests, replying with
 
 Deployment (on the robot / GPU machine, with ``ssr-agent`` + ``openarm`` installed)::
 
-    # On the brain machine, the SSR process auto-starts an embedded bus server,
-    # or run a standalone one:
+    # 1. On the brain machine, start a bus server (any ``ssr`` process also starts
+    #    an embedded one automatically; this is the explicit standalone form):
     ssr bus serve --host 0.0.0.0 --port 8765
 
-    # On the GPU machine, start the bridge:
+    # 2. On the GPU machine, start the bridge (connects to that bus, serves the
+    #    arm.* topics; add --headless to run Isaac without a window):
     ssr-arm-bridge --bus ws://<brain-host>:8765 --task Isaac-Manip-OpenArm-v0
 
-    # Then, on the brain machine, drive an instruction:
-    ssr arm do "把苹果放到橘子上" --bus-url ws://<brain-host>:8765
+    # 3. On the brain machine, drive it in natural language from a normal session
+    #    (the `arm_*` tools come from the bundled ``openarm`` plugin; the old
+    #    ``ssr arm`` command was removed):
+    SSR_BUS_URL=ws://<brain-host>:8765 ssr ask "把苹果放到橘子上"
+    #    ...or just run `ssr` (the TUI) and type the instruction.
 
 This script must launch the Isaac app *before* importing isaaclab env modules, so
 all Isaac imports happen inside :func:`main` after ``AppLauncher``.
