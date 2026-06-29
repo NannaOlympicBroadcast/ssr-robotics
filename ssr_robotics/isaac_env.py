@@ -57,7 +57,7 @@ LIFT_Z = 0.25       # height to lift to after grasping (m)
 
 class IsaacOpenArmEnv:
     def __init__(self, task: str = "Isaac-Manip-OpenArm-v0", steps_per_move: int = 30,
-                 settle_steps: int = 15, num_envs: int = 1):
+                 settle_steps: int = 15, steps_per_waypoint: int = 10, num_envs: int = 1):
         import gymnasium as gym
         import torch
 
@@ -70,6 +70,12 @@ class IsaacOpenArmEnv:
         self.task = task
         self.steps_per_move = steps_per_move
         self.settle_steps = settle_steps
+        # Sim steps to hold each `raw` waypoint. The action space is differential-IK
+        # pose targets, so — exactly like _goto — each target needs several steps for
+        # the controller to actually drive the arm there. Stepping once per waypoint
+        # moves the arm imperceptibly (it never reaches any pose), so a trajectory
+        # looks like no motion at all.
+        self.steps_per_waypoint = steps_per_waypoint
         # The `env_cfg_entry_point` gym.make() is registered with is inert metadata —
         # Isaac Lab requires resolving it into a real cfg instance first. This also
         # forces num_envs=1: the task's registered default is RL-training scale
@@ -143,14 +149,28 @@ class IsaacOpenArmEnv:
         cmd, args = req.command, req.args
         if cmd == "raw":
             t = self.torch
-            dof = int(self.env.unwrapped.action_manager.total_action_dim)
+            if not req.actions:
+                # An empty action list used to "succeed" silently (the loop ran zero
+                # times), so the arm never moved yet the step reported ok — the exact
+                # signature of the brain failing to forward the waypoints. Make it a
+                # loud error instead of silent stillness.
+                raise ValueError("raw skill received no action vectors")
+            am = self.env.unwrapped.action_manager
+            # total_action_dim isn't guaranteed across isaaclab versions (capabilities()
+            # reads it defensively too); fall back to the first vector's width rather
+            # than risk an AttributeError that would abort the whole replay.
+            dof = int(getattr(am, "total_action_dim", 0)) or len(req.actions[0])
+            steps = max(1, int(self.steps_per_waypoint))
+            print(f"[isaac_env] raw: replaying {len(req.actions)} waypoints "
+                  f"x {steps} steps (dof={dof})")
             for i, vec in enumerate(req.actions):
-                if len(vec) != dof:
+                if dof and len(vec) != dof:
                     raise ValueError(f"raw action[{i}] has {len(vec)} dims, expected {dof}")
                 if not all(math.isfinite(v) for v in vec):
                     raise ValueError(f"raw action[{i}] has a non-finite value: {vec}")
                 a = t.tensor([vec] * self._num, dtype=t.float32, device=self.device)
-                self.env.step(a)
+                for _ in range(steps):
+                    self.env.step(a)
             return True
         if cmd == "move_above":
             pos = self._target_xyz(args)
