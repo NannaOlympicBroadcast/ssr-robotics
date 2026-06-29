@@ -27,20 +27,24 @@ import math
 import threading
 
 from . import protocol as P
+from . import vision as V
 
 # Skills the bridge implements on top of the arm's primitive action types. They are
 # deliberately object-agnostic — the bridge knows nothing about *what* it is
-# manipulating, so this generalizes beyond any particular scene. The agent
-# perceives the scene (camera frame + generic object snapshot) and supplies target
-# coordinates; it never refers to objects by a hardcoded name/identity.
+# manipulating, so this generalizes beyond any particular scene. Coordinates are in
+# the robot ROOT frame; the agent gets candidate object positions from the vision
+# snapshot (arm_describe / arm_get_scene "objects", detected by camera) and never
+# refers to objects by a hardcoded name/identity.
 SKILLS = [
     {"name": "pick", "args": {"x": "float", "y": "float", "z": "float?"},
      "grasping": True,
-     "desc": "grasp at a world (x, y[, z]) location and lift clear of the surface"},
+     "desc": "grasp the object nearest root-frame (x, y) and lift it; the robot "
+             "pinpoints the exact grasp point by vision (camera), so (x, y) need "
+             "only be approximate"},
     {"name": "place_at", "args": {"x": "float", "y": "float"},
-     "desc": "place the currently-held object at a world (x, y) location"},
+     "desc": "place the currently-held object at root-frame (x, y)"},
     {"name": "move_above", "args": {"x": "float", "y": "float"},
-     "desc": "move the end-effector above a world (x, y) location"},
+     "desc": "move the end-effector above root-frame (x, y)"},
     {"name": "raw", "args": {"actions": "list[float vectors]"},
      "desc": "replay low-level action vectors matching action_space.dof"},
 ]
@@ -54,9 +58,15 @@ APPROACH_Z = 0.12   # hover height above a target before descending (m)
 GRASP_Z = 0.0
 LIFT_Z = 0.25       # height to lift to after grasping (m)
 
-# Default world height (m) for a pick/place target when the agent gives only x, y —
-# the approximate object resting height on the table.
+# World height (m) of the plane the camera back-projects onto when locating an
+# object by vision — the approximate object resting height on the table — and the
+# default target z for a pick/place when only x, y are given.
 TABLE_Z = 0.055
+
+# Summed finger-joint width above which the gripper is judged to be holding
+# something after a close (an object wedged the fingers open). Proprioceptive, so
+# grasp success needs no ground-truth object state. Tune on the real robot.
+GRIP_HOLD_EPS = 0.005
 
 
 class IsaacOpenArmEnv:
@@ -116,16 +126,47 @@ class IsaacOpenArmEnv:
     def _num(self) -> int:
         return self.env.unwrapped.num_envs
 
-    # ------------------------------------------------------------ scene state
+    # ------------------------------------------------------------ perception
+    def _perceive(self) -> list[dict]:
+        """Detect graspable objects BY VISION from the overhead camera.
+
+        Returns a list (largest blob first) of detections, each with the centroid
+        ``pixel``, blob ``pixels`` count, and the back-projected position in both
+        ``world`` and robot-``root`` frames. Uses NO ground-truth scene state and
+        no hardcoded object identity — see :mod:`ssr_robotics.vision`.
+        """
+        from isaaclab.utils.math import matrix_from_quat
+
+        cam = self._scene()["tiled_camera"]
+        rgb = cam.data.output["rgb"][0].detach().cpu().numpy()[..., :3].astype("float32")
+        blobs = V.connected_blobs(V.foreground_mask(rgb))
+        K = cam.data.intrinsic_matrices[0].detach().cpu().numpy()
+        cam_pos = cam.data.pos_w[0].detach().cpu().numpy()
+        cam_rot = matrix_from_quat(cam.data.quat_w_ros[0]).detach().cpu().numpy()
+        t = self.torch
+        robot = self._scene()["robot"]
+        dets = []
+        for (u, v, n) in blobs:
+            pw = V.pixel_to_table_point(u, v, K, cam_pos, cam_rot, TABLE_Z)
+            if pw is None:
+                continue
+            pwt = t.tensor([pw], dtype=t.float32, device=self.device)
+            pb, _ = self._sub(robot.data.root_pos_w, robot.data.root_quat_w, pwt)
+            dets.append({
+                "pixel": [round(float(u), 1), round(float(v), 1)], "pixels": int(n),
+                "world": [round(float(c), 4) for c in pw],
+                "root": [round(float(pb[0, 0]), 4), round(float(pb[0, 1]), 4),
+                         round(float(pb[0, 2]), 4)],
+            })
+        return dets
+
     def objects_world(self) -> dict:
-        """Generic scene snapshot: every rigid object's world position keyed by its
-        own scene key — no hardcoded object identities. Situational awareness for
-        the agent (alongside the camera frame); the agent drives by coordinates."""
-        scene = self._scene()
-        out = {}
-        for key in scene.rigid_objects.keys():
-            p = scene[key].data.root_pos_w[0]
-            out[key] = [round(float(p[0]), 4), round(float(p[1]), 4), round(float(p[2]), 4)]
+        """Perceived object positions (robot ROOT frame) BY VISION, keyed generically
+        (obj0, obj1, … largest blob first). No ground-truth scene state — this is the
+        situational awareness the agent uses to choose a pick coordinate."""
+        dets = self._perceive()
+        out = {f"obj{i}": d["root"] for i, d in enumerate(dets)}
+        print(f"[isaac_env] vision: detected {len(dets)} object(s) -> {out}")
         return out
 
     # --------------------------------------------------------- IK stepping
@@ -210,8 +251,22 @@ class IsaacOpenArmEnv:
             return [float(args["x"]), float(args["y"]), z]
         raise ValueError("target needs 'x' and 'y' (and optionally 'z')")
 
+    def _grasp_point(self, xyz: list) -> list:
+        """Refine an approximate target to the nearest VISION-detected object (robot
+        root frame): the robot decides the exact grasp position by looking, not from
+        ground-truth state. Raises if vision sees nothing — never falls back to
+        privileged scene data."""
+        dets = self._perceive()
+        if not dets:
+            raise ValueError("vision: no graspable object detected in the camera frame")
+        tx, ty = float(xyz[0]), float(xyz[1])
+        best = min(dets, key=lambda d: (d["root"][0] - tx) ** 2 + (d["root"][1] - ty) ** 2)
+        print(f"[isaac_env] vision: pick hint ({tx:.4f},{ty:.4f}) -> nearest detection "
+              f"root={best['root']} pixel={best['pixel']} pixels={best['pixels']}")
+        return list(best["root"])
+
     def _pick(self, xyz: list) -> bool:
-        p = [float(xyz[0]), float(xyz[1]), float(xyz[2])]
+        p = self._grasp_point(xyz)  # exact grasp point comes from vision
         above = [p[0], p[1], p[2] + APPROACH_Z]
         grasp = [p[0], p[1], p[2] + GRASP_Z]
         self._goto(above, gripper_open=True)
@@ -219,10 +274,10 @@ class IsaacOpenArmEnv:
         self._goto(grasp, gripper_open=False, steps=self.settle_steps)  # close
         lift = [p[0], p[1], p[2] + LIFT_Z]
         self._goto(lift, gripper_open=False)
-        # Success is judged generically (gripper closed on something that lifted) —
-        # an evaluation signal, not used to drive the grasp, and not tied to any
-        # specific object identity.
-        ok = self._grasp_metrics()["grasped"]
+        # Proprioceptive success: after closing, an object wedges the fingers open.
+        gw = self._gripper_width()
+        ok = bool(gw > GRIP_HOLD_EPS)
+        print(f"[isaac_env] pick: gripper_width={gw:.4f} -> grasped={ok}")
         self._holding = ok
         return ok
 
@@ -243,24 +298,12 @@ class IsaacOpenArmEnv:
         return float(robot.data.joint_pos[0, ids].sum()) if ids else 0.0
 
     def _grasp_metrics(self) -> dict:
-        """Generic grasp check: gripper closed onto *some* rigid object that has been
-        lifted clear of the surface, scanning all scene objects (no hardcoded
-        identity). An evaluation signal only — never drives the grasp."""
-        scene = self._scene()
-        gripper_width = self._gripper_width()
-        ee_w = scene["ee_frame"].data.target_pos_w[0, 0]
-        grasped = False
-        height = None
-        if gripper_width < 0.03:
-            for key in scene.rigid_objects.keys():
-                obj_w = scene[key].data.root_pos_w[0]
-                dist = float(self.torch.linalg.norm(obj_w - ee_w))
-                h = float(obj_w[2])
-                if dist < 0.10 and h > 0.10:
-                    grasped, height = True, h
-                    break
-        return {"grasped": grasped, "gripper_width": round(gripper_width, 4),
-                "object_height": round(height, 4) if height is not None else None}
+        """Grasp state from proprioception only — whether a grasp is currently held
+        (determined at pick time from gripper width) plus the live gripper width. No
+        ground-truth object position is read."""
+        return {"grasped": bool(self._holding),
+                "gripper_width": round(self._gripper_width(), 4),
+                "object_height": None}
 
     def metrics(self) -> dict:
         grasp = self._grasp_metrics()
