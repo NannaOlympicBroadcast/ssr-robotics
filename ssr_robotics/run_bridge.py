@@ -14,11 +14,14 @@ Deployment (on the robot / GPU machine, with ``ssr-agent`` + ``openarm`` install
     #    arm.* topics; add --headless to run Isaac without a window):
     ssr-arm-bridge --bus ws://<brain-host>:8765 --task Isaac-Manip-OpenArm-v0
 
-    # 3. On the brain machine, drive it in natural language from a normal session
-    #    (the `arm_*` tools come from the bundled ``openarm`` plugin; the old
-    #    ``ssr arm`` command was removed):
-    SSR_BUS_URL=ws://<brain-host>:8765 ssr ask "把苹果放到橘子上"
-    #    ...or just run `ssr` (the TUI) and type the instruction.
+    # 3. On the brain machine, drive it in natural language. The `arm_*` tools come
+    #    from the bundled ``openarm`` plugin (the old ``ssr arm`` command was
+    #    removed). The arm runs an async suspend -> completion -> wake loop, so the
+    #    brain process must stay alive for it: use the interactive TUI, or
+    #    `ssr ask --keep-alive` for a headless one-shot (a bare `ssr ask` exits
+    #    before the loop can react).
+    ssr                                            # TUI, then type the instruction
+    ssr ask --keep-alive 120 "把苹果放到橘子上"     # headless, stays alive 120s idle
 
 This script must launch the Isaac app *before* importing isaaclab env modules, so
 all Isaac imports happen inside :func:`main` after ``AppLauncher``.
