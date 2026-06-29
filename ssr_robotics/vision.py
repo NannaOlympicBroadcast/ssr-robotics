@@ -66,6 +66,31 @@ def connected_blobs(mask, min_pixels: int = 15):
     return blobs
 
 
+def pixel_to_point_with_depth(u, v, depth, K, cam_pos, cam_rot):
+    """Unproject pixel ``(u, v)`` at planar ``depth`` to a world point.
+
+    ``depth`` is the distance to the image plane (optical +Z), i.e. Isaac Lab's
+    ``distance_to_image_plane`` output. Returns world ``[x, y, z]`` (NumPy array),
+    or ``None`` if the depth is missing/non-finite/non-positive (e.g. background).
+
+    Args mirror :func:`pixel_to_table_point` (``cam_rot`` is world ``<-`` camera
+    optical, the matrix of the camera's ``quat_w_ros``). Unlike the table-plane
+    method this needs no surface-height assumption, so objects of differing height
+    localize correctly.
+    """
+    if depth is None:
+        return None
+    d = float(depth)
+    if not np.isfinite(d) or d <= 0.0:
+        return None
+    K = np.asarray(K, dtype=float)
+    cam_pos = np.asarray(cam_pos, dtype=float)
+    cam_rot = np.asarray(cam_rot, dtype=float)
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    p_cam = np.array([(u - cx) / fx * d, (v - cy) / fy * d, d])  # optical frame
+    return cam_pos + cam_rot @ p_cam
+
+
 def pixel_to_table_point(u, v, K, cam_pos, cam_rot, table_z):
     """Back-project pixel ``(u, v)`` onto the world plane ``z = table_z``.
 

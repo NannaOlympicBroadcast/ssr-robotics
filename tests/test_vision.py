@@ -63,6 +63,34 @@ def test_pixel_to_table_point_offset_pixel_has_correct_sign():
     assert math.isclose(p[0], 1.0, abs_tol=1e-6) and math.isclose(p[1], 0.0, abs_tol=1e-6)
 
 
+def test_pixel_to_point_with_depth_matches_table_plane_when_consistent():
+    # Camera 1 m above the plane looking straight down; a pixel whose depth is the
+    # full 1 m must land on the table plane at the same point the table-plane method
+    # gives — depth and plane agree when the object sits on the table.
+    K = np.array([[200.0, 0, 160.0], [0, 200.0, 120.0], [0, 0, 1.0]])
+    cam_pos = np.array([0.0, 0.0, 1.0])
+    cam_rot = np.array([[1.0, 0, 0], [0, -1.0, 0], [0, 0, -1.0]])
+    u, v = 360.0, 120.0
+    plane = V.pixel_to_table_point(u, v, K, cam_pos, cam_rot, table_z=0.0)
+    # Depth to image plane for this pixel: the optical +Z component to reach z=0.
+    # ray optical dir z-component maps to world -z; at world z=0 the planar depth is
+    # cam height / |dir_world_z| with dir_cam z = 1 → here 1.0 m straight component.
+    depth = 1.0
+    pt = V.pixel_to_point_with_depth(u, v, depth, K, cam_pos, cam_rot)
+    assert pt is not None
+    # Both should agree on x (1.0) and z (0.0); plane method pins z exactly.
+    assert math.isclose(pt[0], plane[0], abs_tol=1e-6)
+    assert math.isclose(pt[2], 0.0, abs_tol=1e-6)
+
+
+def test_pixel_to_point_with_depth_rejects_invalid_depth():
+    K = np.array([[200.0, 0, 160.0], [0, 200.0, 120.0], [0, 0, 1.0]])
+    cam_pos = np.array([0.0, 0.0, 1.0])
+    cam_rot = np.eye(3)
+    for bad in (None, 0.0, -0.5, float("inf"), float("nan")):
+        assert V.pixel_to_point_with_depth(160.0, 120.0, bad, K, cam_pos, cam_rot) is None
+
+
 def test_pixel_to_table_point_ray_parallel_returns_none():
     K = np.array([[200.0, 0, 160.0], [0, 200.0, 120.0], [0, 0, 1.0]])
     cam_pos = np.array([0.0, 0.0, 1.0])

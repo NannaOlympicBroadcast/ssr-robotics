@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import threading
+import traceback
 
 from . import protocol as P
 from . import vision as V
@@ -49,8 +50,12 @@ SKILLS = [
      "desc": "replay low-level action vectors matching action_space.dof"},
 ]
 
-# Fixed top-down grasp orientation (quaternion wxyz) in the robot root frame.
-# Tune on the real robot if the gripper approach differs.
+# Defaults for the tunable manipulation parameters below. They are *defaults* only:
+# every one is overridable per-instance via the IsaacOpenArmEnv constructor (and the
+# constructor reads SSR_ARM_* env vars), so nothing here is baked in — a different
+# gripper, object size or surface height needs no code edit.
+
+# Default grasp orientation (quaternion wxyz) in the robot root frame (top-down).
 GRASP_QUAT = (0.0, 1.0, 0.0, 0.0)
 
 APPROACH_Z = 0.12   # hover height above a target before descending (m)
@@ -59,9 +64,13 @@ GRASP_Z = 0.0
 LIFT_Z = 0.25       # height to lift to after grasping (m)
 
 # World height (m) of the plane the camera back-projects onto when locating an
-# object by vision — the approximate object resting height on the table — and the
-# default target z for a pick/place when only x, y are given.
+# object by vision (used only when no depth is available) — the approximate object
+# resting height on the table — and the default target z for a pick/place when only
+# x, y are given.
 TABLE_Z = 0.055
+
+# Chroma threshold for the vision foreground/background split (see vision.py).
+CHROMA_THRESH = 45.0
 
 # Summed finger-joint width above which the gripper is judged to be holding
 # something after a close (an object wedged the fingers open). Proprioceptive, so
@@ -69,9 +78,24 @@ TABLE_Z = 0.055
 GRIP_HOLD_EPS = 0.005
 
 
+def _env_float(name: str, default: float) -> float:
+    """Read a float override from the environment, ignoring blank/garbage values."""
+    import os
+
+    raw = os.environ.get(name, "")
+    try:
+        return float(raw) if raw.strip() else default
+    except (TypeError, ValueError):
+        return default
+
+
 class IsaacOpenArmEnv:
     def __init__(self, task: str = "Isaac-Manip-OpenArm-v0", steps_per_move: int = 30,
-                 settle_steps: int = 15, steps_per_waypoint: int = 10, num_envs: int = 1):
+                 settle_steps: int = 15, steps_per_waypoint: int = 10, num_envs: int = 1,
+                 grasp_quat=GRASP_QUAT, approach_z: float | None = None,
+                 grasp_z: float | None = None, lift_z: float | None = None,
+                 table_z: float | None = None, chroma_thresh: float | None = None,
+                 grip_hold_eps: float | None = None):
         import gymnasium as gym
         import torch
 
@@ -90,6 +114,15 @@ class IsaacOpenArmEnv:
         # moves the arm imperceptibly (it never reaches any pose), so a trajectory
         # looks like no motion at all.
         self.steps_per_waypoint = steps_per_waypoint
+        # Tunable manipulation parameters — constructor arg wins, else SSR_ARM_* env
+        # var, else the module default. None of these are hardcoded into the logic.
+        self.grasp_quat = tuple(grasp_quat)
+        self.approach_z = _env_float("SSR_ARM_APPROACH_Z", APPROACH_Z) if approach_z is None else float(approach_z)
+        self.grasp_z = _env_float("SSR_ARM_GRASP_Z", GRASP_Z) if grasp_z is None else float(grasp_z)
+        self.lift_z = _env_float("SSR_ARM_LIFT_Z", LIFT_Z) if lift_z is None else float(lift_z)
+        self.table_z = _env_float("SSR_ARM_TABLE_Z", TABLE_Z) if table_z is None else float(table_z)
+        self.chroma_thresh = _env_float("SSR_ARM_CHROMA", CHROMA_THRESH) if chroma_thresh is None else float(chroma_thresh)
+        self.grip_hold_eps = _env_float("SSR_ARM_GRIP_EPS", GRIP_HOLD_EPS) if grip_hold_eps is None else float(grip_hold_eps)
         # The `env_cfg_entry_point` gym.make() is registered with is inert metadata —
         # Isaac Lab requires resolving it into a real cfg instance first. This also
         # forces num_envs=1: the task's registered default is RL-training scale
@@ -100,11 +133,21 @@ class IsaacOpenArmEnv:
         cam = self.env.unwrapped.scene["tiled_camera"]
         self.CAM_H, self.CAM_W = int(cam.image_shape[0]), int(cam.image_shape[1])
         self._holding: bool = False  # whether a grasp is currently held
+        # Perception cache: vision is recomputed lazily and only after the scene has
+        # actually moved (a sim step invalidates it), so reporting state/capabilities
+        # back-to-back doesn't re-run the camera pipeline several times per request.
+        self._perceive_cache: list[dict] | None = None
         # Set from another thread (the bus-callback handler on reset) to ask a
         # running multi-step skill to bail out, so a reset doesn't have to wait for
         # a long raw replay to finish before it can run.
         self._interrupt = threading.Event()
         self.reset()
+
+    def _step(self, action):
+        """Advance the sim one step and invalidate the perception cache (the scene
+        moved, so any cached detection is now stale)."""
+        self._perceive_cache = None
+        return self.env.step(action)
 
     def interrupt(self) -> None:
         """Ask an in-flight multi-step skill (e.g. a raw replay) to stop ASAP.
@@ -116,6 +159,7 @@ class IsaacOpenArmEnv:
     # ------------------------------------------------------------------ env
     def reset(self, target: str | None = None) -> None:
         self._interrupt.clear()
+        self._perceive_cache = None
         self.env.reset()
         self._holding = False
 
@@ -133,13 +177,29 @@ class IsaacOpenArmEnv:
         Returns a list (largest blob first) of detections, each with the centroid
         ``pixel``, blob ``pixels`` count, and the back-projected position in both
         ``world`` and robot-``root`` frames. Uses NO ground-truth scene state and
-        no hardcoded object identity — see :mod:`ssr_robotics.vision`.
+        no hardcoded object identity — see :mod:`ssr_robotics.vision`. The result is
+        cached until the next sim step (see :meth:`_step`), so repeated state/cap
+        reports don't re-run the pipeline.
+
+        Each blob is back-projected using the camera's per-pixel **depth** when the
+        camera provides it (``distance_to_image_plane``) — exact 3-D, robust to
+        objects of differing height — and falls back to intersecting the ray with
+        the ``table_z`` plane only when depth is unavailable.
         """
+        if self._perceive_cache is not None:
+            return self._perceive_cache
+
         from isaaclab.utils.math import matrix_from_quat
 
         cam = self._scene()["tiled_camera"]
-        rgb = cam.data.output["rgb"][0].detach().cpu().numpy()[..., :3].astype("float32")
-        blobs = V.connected_blobs(V.foreground_mask(rgb))
+        out = cam.data.output
+        rgb = out["rgb"][0].detach().cpu().numpy()[..., :3].astype("float32")
+        depth = None
+        if "distance_to_image_plane" in out:
+            depth = out["distance_to_image_plane"][0].detach().cpu().numpy()
+            if depth.ndim == 3:
+                depth = depth[..., 0]
+        blobs = V.connected_blobs(V.foreground_mask(rgb, self.chroma_thresh))
         K = cam.data.intrinsic_matrices[0].detach().cpu().numpy()
         cam_pos = cam.data.pos_w[0].detach().cpu().numpy()
         cam_rot = matrix_from_quat(cam.data.quat_w_ros[0]).detach().cpu().numpy()
@@ -147,40 +207,50 @@ class IsaacOpenArmEnv:
         robot = self._scene()["robot"]
         dets = []
         for (u, v, n) in blobs:
-            pw = V.pixel_to_table_point(u, v, K, cam_pos, cam_rot, TABLE_Z)
+            pw, src = None, "table"
+            if depth is not None:
+                vi, ui = int(round(v)), int(round(u))
+                if 0 <= vi < depth.shape[0] and 0 <= ui < depth.shape[1]:
+                    pw = V.pixel_to_point_with_depth(u, v, float(depth[vi, ui]),
+                                                     K, cam_pos, cam_rot)
+                    if pw is not None:
+                        src = "depth"
+            if pw is None:
+                pw = V.pixel_to_table_point(u, v, K, cam_pos, cam_rot, self.table_z)
             if pw is None:
                 continue
             pwt = t.tensor([pw], dtype=t.float32, device=self.device)
             pb, _ = self._sub(robot.data.root_pos_w, robot.data.root_quat_w, pwt)
             dets.append({
                 "pixel": [round(float(u), 1), round(float(v), 1)], "pixels": int(n),
+                "src": src,
                 "world": [round(float(c), 4) for c in pw],
                 "root": [round(float(pb[0, 0]), 4), round(float(pb[0, 1]), 4),
                          round(float(pb[0, 2]), 4)],
             })
+        self._perceive_cache = dets
+        print(f"[isaac_env] vision: detected {len(dets)} object(s): "
+              f"{[(d['pixel'], d['src'], d['root']) for d in dets]}")
         return dets
 
     def objects_world(self) -> dict:
         """Perceived object positions (robot ROOT frame) BY VISION, keyed generically
         (obj0, obj1, … largest blob first). No ground-truth scene state — this is the
         situational awareness the agent uses to choose a pick coordinate."""
-        dets = self._perceive()
-        out = {f"obj{i}": d["root"] for i, d in enumerate(dets)}
-        print(f"[isaac_env] vision: detected {len(dets)} object(s) -> {out}")
-        return out
+        return {f"obj{i}": d["root"] for i, d in enumerate(self._perceive())}
 
     # --------------------------------------------------------- IK stepping
     def _ik_action(self, pos, gripper_open: bool):
         """Build an [px,py,pz,qw,qx,qy,qz, gripper] action for all envs."""
         t = self.torch
         g = P.GRIPPER_OPEN if gripper_open else P.GRIPPER_CLOSE
-        vec = [float(pos[0]), float(pos[1]), float(pos[2]), *GRASP_QUAT, g]
+        vec = [float(pos[0]), float(pos[1]), float(pos[2]), *self.grasp_quat, g]
         return t.tensor([vec] * self._num, dtype=t.float32, device=self.device)
 
     def _goto(self, pos, gripper_open: bool, steps: int | None = None) -> None:
         action = self._ik_action(pos, gripper_open)
         for _ in range(steps or self.steps_per_move):
-            self.env.step(action)
+            self._step(action)
 
     # -------------------------------------------------------------- skills
     def execute(self, req: "P.ArmActionRequest") -> dict:
@@ -227,12 +297,12 @@ class IsaacOpenArmEnv:
                     raise ValueError(f"raw action[{i}] has a non-finite value: {vec}")
                 a = t.tensor([vec] * self._num, dtype=t.float32, device=self.device)
                 for _ in range(steps):
-                    self.env.step(a)
+                    self._step(a)
             print(f"[isaac_env] raw: done ({len(actions)} waypoints)")
             return True
         if cmd == "move_above":
             pos = self._target_xyz(args)
-            pos[2] = pos[2] + APPROACH_Z
+            pos[2] = pos[2] + self.approach_z
             self._goto(pos, gripper_open=not self._holding)
             return True
         if cmd == "pick":
@@ -247,7 +317,7 @@ class IsaacOpenArmEnv:
         Object-agnostic: the agent supplies the coordinates (from its own
         perception of the camera frame), the bridge just executes them."""
         if "x" in args and "y" in args:
-            z = float(args["z"]) if args.get("z") is not None else TABLE_Z
+            z = float(args["z"]) if args.get("z") is not None else self.table_z
             return [float(args["x"]), float(args["y"]), z]
         raise ValueError("target needs 'x' and 'y' (and optionally 'z')")
 
@@ -267,23 +337,23 @@ class IsaacOpenArmEnv:
 
     def _pick(self, xyz: list) -> bool:
         p = self._grasp_point(xyz)  # exact grasp point comes from vision
-        above = [p[0], p[1], p[2] + APPROACH_Z]
-        grasp = [p[0], p[1], p[2] + GRASP_Z]
+        above = [p[0], p[1], p[2] + self.approach_z]
+        grasp = [p[0], p[1], p[2] + self.grasp_z]
         self._goto(above, gripper_open=True)
         self._goto(grasp, gripper_open=True)
         self._goto(grasp, gripper_open=False, steps=self.settle_steps)  # close
-        lift = [p[0], p[1], p[2] + LIFT_Z]
+        lift = [p[0], p[1], p[2] + self.lift_z]
         self._goto(lift, gripper_open=False)
         # Proprioceptive success: after closing, an object wedges the fingers open.
         gw = self._gripper_width()
-        ok = bool(gw > GRIP_HOLD_EPS)
+        ok = bool(gw > self.grip_hold_eps)
         print(f"[isaac_env] pick: gripper_width={gw:.4f} -> grasped={ok}")
         self._holding = ok
         return ok
 
     def _place(self, xyz: list) -> bool:
-        above = [xyz[0], xyz[1], xyz[2] + APPROACH_Z + 0.04]
-        drop = [xyz[0], xyz[1], xyz[2] + GRASP_Z + 0.04]
+        above = [xyz[0], xyz[1], xyz[2] + self.approach_z + 0.04]
+        drop = [xyz[0], xyz[1], xyz[2] + self.grasp_z + 0.04]
         self._goto(above, gripper_open=False)
         self._goto(drop, gripper_open=False)
         self._goto(drop, gripper_open=True, steps=self.settle_steps)  # release
@@ -321,6 +391,7 @@ class IsaacOpenArmEnv:
     def capabilities(self) -> dict:
         am = self.env.unwrapped.action_manager
         terms = []
+        ee_body = None
         try:
             names = list(am.active_terms)
             dims = list(am.action_term_dim)
@@ -328,15 +399,27 @@ class IsaacOpenArmEnv:
                 term = am.get_term(name) if hasattr(am, "get_term") else None
                 terms.append({"name": name, "dim": int(dim),
                               "type": type(term).__name__ if term else "?"})
+                # The controlled end-effector body is carried on the IK action term's
+                # cfg — read it instead of hardcoding a robot-specific body name.
+                cfg = getattr(term, "cfg", None)
+                body = getattr(cfg, "body_name", None) if cfg is not None else None
+                if body:
+                    ee_body = body
         except Exception:
-            pass
+            # Don't silently swallow — a broken introspection should be visible, not
+            # masquerade as an empty action space.
+            print(f"[isaac_env] capabilities: action-space introspection failed:\n"
+                  f"{traceback.format_exc()}")
+        # Derive the action-space type from the live terms rather than hardcoding it,
+        # so this stays accurate for a different arm/action configuration.
+        space_type = " + ".join(t["type"] for t in terms) if terms else "?"
         robot = self._scene()["robot"]
         return {
             "action_space": {
-                "type": "DifferentialInverseKinematicsAction(pose)+BinaryGripper",
+                "type": space_type,
                 "dof": int(getattr(am, "total_action_dim", 0)),
                 "terms": terms,
-                "ee_body": "openarm_hand",
+                "ee_body": ee_body or "?",
                 "arm_joints": [n for n in robot.data.joint_names if "finger" not in n],
                 "gripper": {"open": P.GRIPPER_OPEN, "close": P.GRIPPER_CLOSE,
                             "joints": [n for n in robot.data.joint_names if "finger" in n]},
