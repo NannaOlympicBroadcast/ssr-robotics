@@ -149,21 +149,29 @@ class IsaacOpenArmEnv:
         cmd, args = req.command, req.args
         if cmd == "raw":
             t = self.torch
-            if not req.actions:
+            # Accept the waypoints from either the dedicated `actions` field (used by
+            # arm_act) or args["actions"] — which is how the capability descriptor
+            # advertises the raw skill (SKILLS: raw args {"actions": ...}), so the
+            # agent legitimately puts them there via arm_invoke('raw', {...}). Reading
+            # both keeps the bridge working regardless of how the brain forwards them.
+            actions = req.actions or (args.get("actions") if isinstance(args, dict) else None) or []
+            if not isinstance(actions, list) or not actions:
                 # An empty action list used to "succeed" silently (the loop ran zero
-                # times), so the arm never moved yet the step reported ok — the exact
-                # signature of the brain failing to forward the waypoints. Make it a
+                # times), so the arm never moved yet the step reported ok. Make it a
                 # loud error instead of silent stillness.
                 raise ValueError("raw skill received no action vectors")
+            if not req.actions:
+                print("[isaac_env] raw: actions read from args['actions'] "
+                      "(dedicated 'actions' field was empty)")
             am = self.env.unwrapped.action_manager
             # total_action_dim isn't guaranteed across isaaclab versions (capabilities()
             # reads it defensively too); fall back to the first vector's width rather
             # than risk an AttributeError that would abort the whole replay.
-            dof = int(getattr(am, "total_action_dim", 0)) or len(req.actions[0])
+            dof = int(getattr(am, "total_action_dim", 0)) or len(actions[0])
             steps = max(1, int(self.steps_per_waypoint))
-            print(f"[isaac_env] raw: replaying {len(req.actions)} waypoints "
+            print(f"[isaac_env] raw: replaying {len(actions)} waypoints "
                   f"x {steps} steps (dof={dof})")
-            for i, vec in enumerate(req.actions):
+            for i, vec in enumerate(actions):
                 if dof and len(vec) != dof:
                     raise ValueError(f"raw action[{i}] has {len(vec)} dims, expected {dof}")
                 if not all(math.isfinite(v) for v in vec):
