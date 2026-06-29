@@ -10,9 +10,12 @@ space is read from ``env.action_manager`` (term names, dims, classes) and the
 objects from ``env.scene.rigid_objects``. The arm's real action types — grounded
 in the OpenArm repo — are end-effector pose (``DifferentialInverseKinematicsAction``
 on body ``openarm_hand``) plus a binary gripper (``openarm_finger_joint.*``). On
-top of those primitives the bridge implements a few skills (pick / place_on /
-place_at / move_above / raw) the agent may invoke; the agent discovers them via
-``arm_describe`` and plans accordingly.
+top of those primitives the bridge implements a few **object-agnostic** skills
+(pick / place_at / move_above / raw) the agent may invoke; the agent discovers
+them via ``arm_describe`` and plans accordingly. The bridge knows nothing about
+*what* it manipulates — every skill is driven by world coordinates the agent
+supplies from its own perception of the camera frame, never by a hardcoded object
+name or identity — so it generalizes beyond any particular scene.
 
 The Isaac Sim app MUST be launched (``isaaclab.app.AppLauncher``) before
 constructing this class — see ``run_bridge.py`` / ``openarm_isaac_lab/scripts``.
@@ -25,20 +28,19 @@ import threading
 
 from . import protocol as P
 
-# Maps scene rigid-object keys to friendly names the agent sees. Mirrors
-# OBJECT_FRIENDLY_NAMES in the openarm manip env cfg.
-OBJECT_FRIENDLY = {"object": "apple", "orange": "orange"}
-
-# Skills the bridge implements on top of the arm's primitive action types.
+# Skills the bridge implements on top of the arm's primitive action types. They are
+# deliberately object-agnostic — the bridge knows nothing about *what* it is
+# manipulating, so this generalizes beyond any particular scene. The agent
+# perceives the scene (camera frame + generic object snapshot) and supplies target
+# coordinates; it never refers to objects by a hardcoded name/identity.
 SKILLS = [
-    {"name": "pick", "args": {"object": "str"}, "grasping": True,
-     "desc": "grasp a named object and lift it clear of the surface"},
-    {"name": "place_on", "args": {"object": "str"},
-     "desc": "place the currently-held object on top of another named object"},
+    {"name": "pick", "args": {"x": "float", "y": "float", "z": "float?"},
+     "grasping": True,
+     "desc": "grasp at a world (x, y[, z]) location and lift clear of the surface"},
     {"name": "place_at", "args": {"x": "float", "y": "float"},
      "desc": "place the currently-held object at a world (x, y) location"},
-    {"name": "move_above", "args": {"object": "str?", "x": "float?", "y": "float?"},
-     "desc": "move the end-effector above an object or an (x, y) location"},
+    {"name": "move_above", "args": {"x": "float", "y": "float"},
+     "desc": "move the end-effector above a world (x, y) location"},
     {"name": "raw", "args": {"actions": "list[float vectors]"},
      "desc": "replay low-level action vectors matching action_space.dof"},
 ]
@@ -47,13 +49,14 @@ SKILLS = [
 # Tune on the real robot if the gripper approach differs.
 GRASP_QUAT = (0.0, 1.0, 0.0, 0.0)
 
-APPROACH_Z = 0.12   # hover height above an object before descending (m)
-# TCP height relative to the object centre when closing (m). The graspable
-# objects are spheres, so their centre *is* the equator (max cross-section) —
-# closing above it (the previous +0.02) grips the narrowing upper hemisphere
-# and the ball pops out on lift. Close at the equator instead.
+APPROACH_Z = 0.12   # hover height above a target before descending (m)
+# TCP height relative to the target point when closing (m).
 GRASP_Z = 0.0
 LIFT_Z = 0.25       # height to lift to after grasping (m)
+
+# Default world height (m) for a pick/place target when the agent gives only x, y —
+# the approximate object resting height on the table.
+TABLE_Z = 0.055
 
 
 class IsaacOpenArmEnv:
@@ -86,7 +89,7 @@ class IsaacOpenArmEnv:
         self.device = self.env.unwrapped.device
         cam = self.env.unwrapped.scene["tiled_camera"]
         self.CAM_H, self.CAM_W = int(cam.image_shape[0]), int(cam.image_shape[1])
-        self._holding: str | None = None
+        self._holding: bool = False  # whether a grasp is currently held
         # Set from another thread (the bus-callback handler on reset) to ask a
         # running multi-step skill to bail out, so a reset doesn't have to wait for
         # a long raw replay to finish before it can run.
@@ -104,7 +107,7 @@ class IsaacOpenArmEnv:
     def reset(self, target: str | None = None) -> None:
         self._interrupt.clear()
         self.env.reset()
-        self._holding = None
+        self._holding = False
 
     def _scene(self):
         return self.env.unwrapped.scene
@@ -113,28 +116,16 @@ class IsaacOpenArmEnv:
     def _num(self) -> int:
         return self.env.unwrapped.num_envs
 
-    # ------------------------------------------------------- object lookup
-    def _object_key(self, friendly: str) -> str | None:
-        for key, name in OBJECT_FRIENDLY.items():
-            if name == friendly and key in self._scene().rigid_objects:
-                return key
-        return friendly if friendly in self._scene().rigid_objects else None
-
-    def _object_pos_root(self, key: str):
-        """Object position in the robot root frame (x, y, z)."""
-        scene = self._scene()
-        robot = scene["robot"]
-        obj_w = scene[key].data.root_pos_w[:, :3]
-        pos_b, _ = self._sub(robot.data.root_pos_w, robot.data.root_quat_w, obj_w)
-        return pos_b[0]
-
+    # ------------------------------------------------------------ scene state
     def objects_world(self) -> dict:
+        """Generic scene snapshot: every rigid object's world position keyed by its
+        own scene key — no hardcoded object identities. Situational awareness for
+        the agent (alongside the camera frame); the agent drives by coordinates."""
         scene = self._scene()
         out = {}
         for key in scene.rigid_objects.keys():
-            name = OBJECT_FRIENDLY.get(key, key)
             p = scene[key].data.root_pos_w[0]
-            out[name] = [round(float(p[0]), 4), round(float(p[1]), 4), round(float(p[2]), 4)]
+            out[key] = [round(float(p[0]), 4), round(float(p[1]), 4), round(float(p[2]), 4)]
         return out
 
     # --------------------------------------------------------- IK stepping
@@ -201,43 +192,38 @@ class IsaacOpenArmEnv:
         if cmd == "move_above":
             pos = self._target_xyz(args)
             pos[2] = pos[2] + APPROACH_Z
-            self._goto(pos, gripper_open=self._holding is None)
+            self._goto(pos, gripper_open=not self._holding)
             return True
         if cmd == "pick":
-            return self._pick(str(args.get("object", "")))
-        if cmd == "place_on":
-            return self._place(self._target_xyz({"object": args.get("object", "")}))
+            return self._pick(self._target_xyz(args))
         if cmd == "place_at":
             return self._place(self._target_xyz(args))
         raise ValueError(f"unknown skill '{cmd}'")
 
     def _target_xyz(self, args: dict):
-        """Resolve a target to a robot-root-frame [x, y, z] list (mutable)."""
-        if args.get("object"):
-            key = self._object_key(str(args["object"]))
-            if key is None:
-                raise ValueError(f"object '{args['object']}' not in scene")
-            p = self._object_pos_root(key)
-            return [float(p[0]), float(p[1]), float(p[2])]
-        if "x" in args and "y" in args:
-            # z defaults to table height (approx object resting height).
-            return [float(args["x"]), float(args["y"]), 0.055]
-        raise ValueError("target needs an 'object' or 'x'+'y'")
+        """Resolve a coordinate target to a robot-root-frame [x, y, z] list.
 
-    def _pick(self, friendly: str) -> bool:
-        key = self._object_key(friendly)
-        if key is None:
-            raise ValueError(f"object '{friendly}' not in scene")
-        p = self._object_pos_root(key)
-        above = [float(p[0]), float(p[1]), float(p[2]) + APPROACH_Z]
-        grasp = [float(p[0]), float(p[1]), float(p[2]) + GRASP_Z]
+        Object-agnostic: the agent supplies the coordinates (from its own
+        perception of the camera frame), the bridge just executes them."""
+        if "x" in args and "y" in args:
+            z = float(args["z"]) if args.get("z") is not None else TABLE_Z
+            return [float(args["x"]), float(args["y"]), z]
+        raise ValueError("target needs 'x' and 'y' (and optionally 'z')")
+
+    def _pick(self, xyz: list) -> bool:
+        p = [float(xyz[0]), float(xyz[1]), float(xyz[2])]
+        above = [p[0], p[1], p[2] + APPROACH_Z]
+        grasp = [p[0], p[1], p[2] + GRASP_Z]
         self._goto(above, gripper_open=True)
         self._goto(grasp, gripper_open=True)
         self._goto(grasp, gripper_open=False, steps=self.settle_steps)  # close
-        lift = [float(p[0]), float(p[1]), float(p[2]) + LIFT_Z]
+        lift = [p[0], p[1], p[2] + LIFT_Z]
         self._goto(lift, gripper_open=False)
-        ok = self._grasp_metrics(key)["grasped"]
-        self._holding = friendly if ok else None
+        # Success is judged generically (gripper closed on something that lifted) —
+        # an evaluation signal, not used to drive the grasp, and not tied to any
+        # specific object identity.
+        ok = self._grasp_metrics()["grasped"]
+        self._holding = ok
         return ok
 
     def _place(self, xyz: list) -> bool:
@@ -247,7 +233,7 @@ class IsaacOpenArmEnv:
         self._goto(drop, gripper_open=False)
         self._goto(drop, gripper_open=True, steps=self.settle_steps)  # release
         self._goto(above, gripper_open=True)
-        self._holding = None
+        self._holding = False
         return True
 
     # ------------------------------------------------------------- sensing
@@ -256,30 +242,36 @@ class IsaacOpenArmEnv:
         ids = [i for i, n in enumerate(robot.data.joint_names) if "finger" in n]
         return float(robot.data.joint_pos[0, ids].sum()) if ids else 0.0
 
-    def _grasp_metrics(self, key: str | None = None) -> dict:
+    def _grasp_metrics(self) -> dict:
+        """Generic grasp check: gripper closed onto *some* rigid object that has been
+        lifted clear of the surface, scanning all scene objects (no hardcoded
+        identity). An evaluation signal only — never drives the grasp."""
         scene = self._scene()
         gripper_width = self._gripper_width()
+        ee_w = scene["ee_frame"].data.target_pos_w[0, 0]
         grasped = False
         height = None
-        if key and key in scene.rigid_objects:
-            obj_w = scene[key].data.root_pos_w[0]
-            ee_w = scene["ee_frame"].data.target_pos_w[0, 0]
-            dist = float(self.torch.linalg.norm(obj_w - ee_w))
-            height = float(obj_w[2])
-            grasped = bool(height > 0.10 and dist < 0.10 and gripper_width < 0.03)
+        if gripper_width < 0.03:
+            for key in scene.rigid_objects.keys():
+                obj_w = scene[key].data.root_pos_w[0]
+                dist = float(self.torch.linalg.norm(obj_w - ee_w))
+                h = float(obj_w[2])
+                if dist < 0.10 and h > 0.10:
+                    grasped, height = True, h
+                    break
         return {"grasped": grasped, "gripper_width": round(gripper_width, 4),
                 "object_height": round(height, 4) if height is not None else None}
 
     def metrics(self) -> dict:
-        grasp = self._grasp_metrics(self._object_key(self._holding) if self._holding else None)
+        grasp = self._grasp_metrics()
         grasp["objects"] = self.objects_world()
-        grasp["holding"] = self._holding
+        grasp["holding"] = bool(self._holding)
         return grasp
 
     def _report(self, command: str, ok: bool, error: str = "") -> dict:
         m = self.metrics()
         return {"command": command, "ok": ok, "error": error,
-                "holding": self._holding, "objects": m["objects"],
+                "holding": bool(self._holding), "objects": m["objects"],
                 "grasp": {k: m[k] for k in ("grasped", "gripper_width", "object_height")}}
 
     # ------------------------------------------------------- capabilities
