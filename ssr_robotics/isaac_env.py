@@ -6,8 +6,10 @@ Wraps ``Isaac-Manip-OpenArm-v0`` (the IK + camera + apple/orange variant added i
 ``CAM_W`` / ``CAM_H``.
 
 **Capabilities are introspected from the live env**, not hardcoded: the action
-space is read from ``env.action_manager`` (term names, dims, classes) and the
-objects from ``env.scene.rigid_objects``. The arm's real action types — grounded
+space is read from ``env.action_manager`` (term names, dims, classes). Objects are
+**never** read from ``env.scene`` ground truth — they are perceived only through
+the camera (see :meth:`IsaacOpenArmEnv._perceive`), so the bridge generalizes to a
+real RGBD camera with no privileged scene knowledge. The arm's real action types — grounded
 in the OpenArm repo — are end-effector pose (``DifferentialInverseKinematicsAction``
 on body ``openarm_hand``) plus a binary gripper (``openarm_finger_joint.*``). On
 top of those primitives the bridge implements a few **object-agnostic** skills
@@ -137,6 +139,10 @@ class IsaacOpenArmEnv:
         # actually moved (a sim step invalidates it), so reporting state/capabilities
         # back-to-back doesn't re-run the camera pipeline several times per request.
         self._perceive_cache: list[dict] | None = None
+        # Fixed camera calibration (intrinsics + world pose), captured once on first
+        # use — like a real hand-eye calibration — so object localization never
+        # queries the simulator for where things are; see _camera_calibration().
+        self._cam_calib: dict | None = None
         # Set from another thread (the bus-callback handler on reset) to ask a
         # running multi-step skill to bail out, so a reset doesn't have to wait for
         # a long raw replay to finish before it can run.
@@ -171,15 +177,36 @@ class IsaacOpenArmEnv:
         return self.env.unwrapped.num_envs
 
     # ------------------------------------------------------------ perception
+    def _camera_calibration(self) -> dict:
+        """The camera's intrinsics ``K`` + world pose, captured ONCE and cached — the
+        analogue of a real camera's one-time (hand-eye) calibration.
+
+        Reading these here, once, is the *only* time the camera's geometry is taken
+        from the simulator; every subsequent perception uses just the live image and
+        this fixed calibration, so the bridge never asks the simulator *where things
+        are*. The overhead camera is static, so a single capture is exact."""
+        if self._cam_calib is None:
+            from isaaclab.utils.math import matrix_from_quat
+
+            cam = self._scene()["tiled_camera"]
+            self._cam_calib = {
+                "K": cam.data.intrinsic_matrices[0].detach().cpu().numpy(),
+                "pos": cam.data.pos_w[0].detach().cpu().numpy(),
+                "rot": matrix_from_quat(cam.data.quat_w_ros[0]).detach().cpu().numpy(),
+            }
+        return self._cam_calib
+
     def _perceive(self) -> list[dict]:
         """Detect graspable objects BY VISION from the overhead camera.
 
-        Returns a list (largest blob first) of detections, each with the centroid
-        ``pixel``, blob ``pixels`` count, and the back-projected position in both
-        ``world`` and robot-``root`` frames. Uses NO ground-truth scene state and
-        no hardcoded object identity — see :mod:`ssr_robotics.vision`. The result is
-        cached until the next sim step (see :meth:`_step`), so repeated state/cap
-        reports don't re-run the pipeline.
+        The ONLY inputs are the live camera image (+ depth) and the fixed camera
+        calibration (:meth:`_camera_calibration`); the robot's own base pose is used
+        purely to express the result in its control frame. NO object/scene
+        ground-truth is ever read — the bridge has no idea *what* or *where* things
+        are except by looking. Returns a list (largest blob first) of detections
+        with the centroid ``pixel``, blob ``pixels`` count, and the back-projected
+        ``world`` + robot-``root`` positions. Cached until the next sim step
+        (:meth:`_step`) so repeated state/cap reports don't re-run the pipeline.
 
         Each blob is back-projected using the camera's per-pixel **depth** when the
         camera provides it (``distance_to_image_plane``) — exact 3-D, robust to
@@ -188,8 +215,6 @@ class IsaacOpenArmEnv:
         """
         if self._perceive_cache is not None:
             return self._perceive_cache
-
-        from isaaclab.utils.math import matrix_from_quat
 
         cam = self._scene()["tiled_camera"]
         out = cam.data.output
@@ -200,9 +225,8 @@ class IsaacOpenArmEnv:
             if depth.ndim == 3:
                 depth = depth[..., 0]
         blobs = V.connected_blobs(V.foreground_mask(rgb, self.chroma_thresh))
-        K = cam.data.intrinsic_matrices[0].detach().cpu().numpy()
-        cam_pos = cam.data.pos_w[0].detach().cpu().numpy()
-        cam_rot = matrix_from_quat(cam.data.quat_w_ros[0]).detach().cpu().numpy()
+        calib = self._camera_calibration()
+        K, cam_pos, cam_rot = calib["K"], calib["pos"], calib["rot"]
         t = self.torch
         robot = self._scene()["robot"]
         dets = []
