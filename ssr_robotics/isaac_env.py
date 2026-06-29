@@ -21,6 +21,7 @@ constructing this class — see ``run_bridge.py`` / ``openarm_isaac_lab/scripts`
 from __future__ import annotations
 
 import math
+import threading
 
 from . import protocol as P
 
@@ -86,10 +87,22 @@ class IsaacOpenArmEnv:
         cam = self.env.unwrapped.scene["tiled_camera"]
         self.CAM_H, self.CAM_W = int(cam.image_shape[0]), int(cam.image_shape[1])
         self._holding: str | None = None
+        # Set from another thread (the bus-callback handler on reset) to ask a
+        # running multi-step skill to bail out, so a reset doesn't have to wait for
+        # a long raw replay to finish before it can run.
+        self._interrupt = threading.Event()
         self.reset()
+
+    def interrupt(self) -> None:
+        """Ask an in-flight multi-step skill (e.g. a raw replay) to stop ASAP.
+
+        Checked between waypoints, so it cannot break out of a single hung
+        ``env.step``, but it lets a reset preempt a long/runaway replay."""
+        self._interrupt.set()
 
     # ------------------------------------------------------------------ env
     def reset(self, target: str | None = None) -> None:
+        self._interrupt.clear()
         self.env.reset()
         self._holding = None
 
@@ -139,6 +152,7 @@ class IsaacOpenArmEnv:
 
     # -------------------------------------------------------------- skills
     def execute(self, req: "P.ArmActionRequest") -> dict:
+        self._interrupt.clear()  # fresh command — drop any stale interrupt
         try:
             ok = self._run_skill(req)
             return self._report(req.command, ok=ok)
@@ -172,6 +186,9 @@ class IsaacOpenArmEnv:
             print(f"[isaac_env] raw: replaying {len(actions)} waypoints "
                   f"x {steps} steps (dof={dof})")
             for i, vec in enumerate(actions):
+                if self._interrupt.is_set():
+                    print(f"[isaac_env] raw: interrupted at waypoint {i}/{len(actions)}")
+                    return False
                 if dof and len(vec) != dof:
                     raise ValueError(f"raw action[{i}] has {len(vec)} dims, expected {dof}")
                 if not all(math.isfinite(v) for v in vec):
@@ -179,6 +196,7 @@ class IsaacOpenArmEnv:
                 a = t.tensor([vec] * self._num, dtype=t.float32, device=self.device)
                 for _ in range(steps):
                     self.env.step(a)
+            print(f"[isaac_env] raw: done ({len(actions)} waypoints)")
             return True
         if cmd == "move_above":
             pos = self._target_xyz(args)

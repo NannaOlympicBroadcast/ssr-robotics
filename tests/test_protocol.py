@@ -85,6 +85,32 @@ def test_runner_serves_skill_and_reports_completion():
     assert base64.b64decode(out["p"]["frame_b64"]).startswith(b"\x89PNG")
 
 
+def test_reset_interrupts_and_drains_queued_jobs():
+    """A reset must preempt the backlog: without this, the reset job sits behind a
+    long raw replay holding the sim thread and the sim looks frozen until it ends.
+    _on_reset interrupts any in-flight skill and drops queued (not-yet-run) jobs."""
+    bus = MessageBus(name="t", source="t")
+    env = _StubEnv()
+    env.interrupted = False
+    env.interrupt = lambda: setattr(env, "interrupted", True)
+    runner = EnvRunner(bus, env).start()
+
+    # Two execute jobs pile up (handlers only enqueue; pump hasn't run them).
+    for _ in range(2):
+        req = P.ArmActionRequest(seq_id="", episode=1, command="pick", args={"object": "apple"})
+        bus.publish(P.TOPIC_ACTION_EXECUTE, req.to_payload())
+
+    done = threading.Event()
+    bus.subscribe(P.TOPIC_STATE, lambda ev: done.set())
+    bus.publish(P.TOPIC_RESET, {"episode": 2})
+
+    assert env.interrupted is True            # in-flight skill asked to stop
+    assert runner.pump(timeout=2.0)           # next job out of the queue is the reset
+    assert done.wait(2.0)                      # ...which published fresh state
+    assert runner.pump(timeout=0.2) is False  # the two execute jobs were dropped
+    runner.stop()
+
+
 def test_env_only_touched_from_pump_thread():
     """The bug this guards against: Isaac Sim's sim/render context is not
     thread-safe and may only be driven from the thread that owns

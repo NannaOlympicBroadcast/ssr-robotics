@@ -116,15 +116,38 @@ class EnvRunner:
         self._jobs.put(self._publish_caps)
 
     def _on_reset(self, ev) -> None:
+        # A reset means "stop and start over". Without this, the reset job would sit
+        # behind whatever is already queued/running — e.g. a long raw replay holding
+        # the sim thread — so the sim looks frozen until that finishes. Interrupt any
+        # in-flight multi-step skill and drop the queued backlog so reset runs next.
+        interrupt = getattr(self.env, "interrupt", None)
+        if callable(interrupt):
+            interrupt()
+        dropped = self._drain_jobs()
+        print(f"[env_runner] received reset (dropped {dropped} queued job(s))")
+
         def _job() -> None:
+            print("[env_runner] reset: running env.reset()")
             try:
                 self.env.reset()
                 snap = self.env.metrics()
                 self._publish(P.TOPIC_STATE, {**snap, **self._frame_fields()})
+                print("[env_runner] reset: done")
             except Exception:
                 self._log_exc("reset")
 
         self._jobs.put(_job)
+
+    def _drain_jobs(self) -> int:
+        """Discard every queued (not-yet-running) job; return how many were dropped."""
+        dropped = 0
+        while True:
+            try:
+                self._jobs.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                break
+        return dropped
 
     def _on_state_request(self, ev) -> None:
         def _job() -> None:
