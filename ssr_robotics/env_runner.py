@@ -138,6 +138,13 @@ class EnvRunner:
 
     def _on_execute(self, ev) -> None:
         req = P.ArmActionRequest.from_payload(ev.payload)
+        # Log every received command on the bridge console. `actions=N` is the
+        # single most useful field for debugging "the arm won't move": if a `raw`
+        # request arrives with actions=0, the waypoints never left the brain (the
+        # brain build is stale / not forwarding them); if N>0 but the arm still
+        # doesn't move, the problem is downstream in env.execute.
+        print(f"[env_runner] received execute: command={req.command!r} "
+              f"seq={req.seq_id} actions={len(req.actions)} args={req.args}")
 
         def _job() -> None:
             try:
@@ -146,6 +153,8 @@ class EnvRunner:
             except Exception:
                 self._log_exc("execute")
                 return
+            print(f"[env_runner] execute done: command={req.command!r} "
+                  f"seq={req.seq_id} ok={result.get('ok')} error={result.get('error')!r}")
             payload = {"seq_id": req.seq_id, "episode": req.episode,
                        "status": "settled", **result, **frame}
             topic = (P.TOPIC_GRASP_COMPLETED if req.command in _GRASPING
