@@ -55,6 +55,33 @@ ssr arm do "把苹果放到橘子上" --bus-url ws://127.0.0.1:8765
 
 Start order: **bus server → bridge → `ssr arm do`**.
 
+## Tuning grasp reliability
+
+Grasping fails most often for four reasons; each has a knob here (all are
+`IsaacOpenArmEnv` constructor args, overridable per-instance via `SSR_ARM_*` env
+vars, so no code edit is needed):
+
+* **Overhead camera too high / wrong angle.** Back-projecting 2-D pixels from a
+  high, oblique view carries a large perspective error, so the arm grasps off to
+  the side. Lower the camera (smaller Z) and zoom it onto the working area in the
+  scene; if you add a closer camera prim, point the bridge at it with
+  `SSR_ARM_CAMERA=<prim_name>` (default `tiled_camera`). Depth-based
+  back-projection is already preferred over the table-plane fallback.
+* **Single long-range estimate.** Set `SSR_ARM_WRIST_CAMERA=<prim_name>` to enable
+  an **eye-in-hand** correction: `pick` moves above the target from the overhead
+  estimate, then re-centres laterally on the object using the wrist camera before
+  descending. Off by default (degrades gracefully to overhead-only).
+* **Obstacles with no collision shape.** The arm will drive a straight line through
+  the table/stand. Advertise them to the planner with
+  `SSR_ARM_OBSTACLES='[{"name":"stand","aabb":[xmin,ymin,zmin,xmax,ymax,zmax]}]'`
+  (robot root frame); they surface in `arm.capabilities → obstacles` and the brain
+  is prompted to route around them.
+* **Waypoints never reached exactly.** Differential-IK never lands precisely on a
+  target, so a strict check stalls or false-fails. `SSR_ARM_POS_TOL` (default
+  `0.01` m) is the "arrived" radius: once the end-effector TCP is within it the
+  move stops early instead of burning steps or over-driving. Widen it if moves are
+  judged failed; tighten it for finer placement.
+
 ## Tests (no GPU)
 
 ```bash
