@@ -42,7 +42,8 @@ SKILLS = [
     {"name": "pick", "args": {"x": "float", "y": "float", "z": "float?"},
      "grasping": True,
      "desc": "grasp the object nearest root-frame (x, y) and lift it; the robot "
-             "pinpoints the exact grasp point by vision (camera), so (x, y) need "
+             "pinpoints the exact grasp point by vision (overhead camera, plus a "
+             "local wrist-camera re-centre when one is configured), so (x, y) need "
              "only be approximate"},
     {"name": "place_at", "args": {"x": "float", "y": "float"},
      "desc": "place the currently-held object at root-frame (x, y)"},
@@ -79,6 +80,21 @@ CHROMA_THRESH = 45.0
 # grasp success needs no ground-truth object state. Tune on the real robot.
 GRIP_HOLD_EPS = 0.005
 
+# Waypoint position tolerance (m): once the end-effector TCP is within this of a
+# commanded pose, the move is judged "arrived" and stops early instead of burning
+# the remaining fixed steps (or over-driving past it). Differential-IK never lands
+# *exactly* on a target, so requiring exactness would either waste steps or, with
+# too few of them, report a phantom failure on a move that is physically fine. A
+# small tolerance is what makes multi-waypoint motion reliable. Tune on the robot.
+POS_TOL = 0.01
+
+# Default overhead camera prim name in the scene. Overridable (SSR_ARM_CAMERA /
+# constructor) so a re-positioned or lowered/zoomed camera — which sharply reduces
+# the perspective error when back-projecting pixels to 3-D — can be selected with
+# no code change. A wrist (eye-in-hand) camera is OFF by default; set its prim name
+# via SSR_ARM_WRIST_CAMERA to enable a local close-range grasp refinement pass.
+CAMERA_NAME = "tiled_camera"
+
 
 def _env_float(name: str, default: float) -> float:
     """Read a float override from the environment, ignoring blank/garbage values."""
@@ -91,13 +107,64 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _within_tol(current, target, tol: float) -> bool:
+    """Whether 3-D point ``current`` is within ``tol`` metres (Euclidean) of
+    ``target``.
+
+    Used to decide a commanded waypoint has actually been reached. ``current`` may
+    be ``None`` (the TCP could not be read) → treated as *not* reached, so motion
+    safely falls back to running its fixed step budget. A non-positive ``tol``
+    disables the early-exit entirely (full fixed steps run)."""
+    if current is None or tol is None or tol <= 0:
+        return False
+    return sum((float(a) - float(b)) ** 2 for a, b in zip(current, target)) <= tol * tol
+
+
+def _parse_obstacles(raw) -> list:
+    """Parse the ``SSR_ARM_OBSTACLES`` JSON into a list of obstacle descriptors.
+
+    Obstacles are *advertised* to the brain (in :meth:`capabilities`) so its planner
+    can treat them as collision bodies to route around — the sim deliberately leaves
+    some supports without a collision shape, so the arm will happily drive a
+    straight line through the table/stand unless the planner is told not to. Expected
+    JSON: a list of ``{"name": str, "aabb": [xmin, ymin, zmin, xmax, ymax, zmax]}``
+    in the robot ROOT frame. Returns ``[]`` on blank/garbage rather than raising —
+    obstacles are optional metadata, never required for the bridge to run."""
+    import json
+
+    if not raw or not str(raw).strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for item in data:
+        if not isinstance(item, dict) or "aabb" not in item:
+            continue
+        try:
+            aabb = [float(c) for c in item["aabb"]]
+        except (TypeError, ValueError):
+            continue
+        if len(aabb) != 6:
+            continue
+        out.append({"name": str(item.get("name") or f"obstacle{len(out)}"), "aabb": aabb})
+    return out
+
+
 class IsaacOpenArmEnv:
     def __init__(self, task: str = "Isaac-Manip-OpenArm-v0", steps_per_move: int = 30,
                  settle_steps: int = 15, steps_per_waypoint: int = 10, num_envs: int = 1,
                  grasp_quat=GRASP_QUAT, approach_z: float | None = None,
                  grasp_z: float | None = None, lift_z: float | None = None,
                  table_z: float | None = None, chroma_thresh: float | None = None,
-                 grip_hold_eps: float | None = None):
+                 grip_hold_eps: float | None = None, pos_tol: float | None = None,
+                 camera: str | None = None, wrist_camera: str | None = None,
+                 obstacles=None):
+        import os
+
         import gymnasium as gym
         import torch
 
@@ -125,6 +192,17 @@ class IsaacOpenArmEnv:
         self.table_z = _env_float("SSR_ARM_TABLE_Z", TABLE_Z) if table_z is None else float(table_z)
         self.chroma_thresh = _env_float("SSR_ARM_CHROMA", CHROMA_THRESH) if chroma_thresh is None else float(chroma_thresh)
         self.grip_hold_eps = _env_float("SSR_ARM_GRIP_EPS", GRIP_HOLD_EPS) if grip_hold_eps is None else float(grip_hold_eps)
+        # Waypoint arrival tolerance — once the TCP is this close to a commanded pose
+        # the move stops early (see _goto). Constructor arg wins, else SSR_ARM_POS_TOL.
+        self.pos_tol = _env_float("SSR_ARM_POS_TOL", POS_TOL) if pos_tol is None else float(pos_tol)
+        # Which scene camera the overhead perception reads, and an optional wrist
+        # (eye-in-hand) camera for close-range grasp refinement (empty = disabled).
+        self.camera_name = camera or os.environ.get("SSR_ARM_CAMERA") or CAMERA_NAME
+        self.wrist_camera_name = (wrist_camera if wrist_camera is not None
+                                  else os.environ.get("SSR_ARM_WRIST_CAMERA", "")).strip()
+        # Obstacles advertised to the brain's planner as collision bodies to avoid.
+        self.obstacles = (_parse_obstacles(os.environ.get("SSR_ARM_OBSTACLES", ""))
+                          if obstacles is None else list(obstacles))
         # The `env_cfg_entry_point` gym.make() is registered with is inert metadata —
         # Isaac Lab requires resolving it into a real cfg instance first. This also
         # forces num_envs=1: the task's registered default is RL-training scale
@@ -132,7 +210,7 @@ class IsaacOpenArmEnv:
         env_cfg = parse_env_cfg(task, num_envs=num_envs)
         self.env = gym.make(task, cfg=env_cfg, render_mode="rgb_array")
         self.device = self.env.unwrapped.device
-        cam = self.env.unwrapped.scene["tiled_camera"]
+        cam = self.env.unwrapped.scene[self.camera_name]
         self.CAM_H, self.CAM_W = int(cam.image_shape[0]), int(cam.image_shape[1])
         self._holding: bool = False  # whether a grasp is currently held
         # Perception cache: vision is recomputed lazily and only after the scene has
@@ -143,6 +221,10 @@ class IsaacOpenArmEnv:
         # use — like a real hand-eye calibration — so object localization never
         # queries the simulator for where things are; see _camera_calibration().
         self._cam_calib: dict | None = None
+        # End-effector body name (for reading the live TCP position to judge waypoint
+        # arrival), resolved lazily from the IK action term and cached. "" once
+        # resolution has been attempted and failed, so we don't retry every move.
+        self._ee_body: str | None = None
         # Set from another thread (the bus-callback handler on reset) to ask a
         # running multi-step skill to bail out, so a reset doesn't have to wait for
         # a long raw replay to finish before it can run.
@@ -177,46 +259,41 @@ class IsaacOpenArmEnv:
         return self.env.unwrapped.num_envs
 
     # ------------------------------------------------------------ perception
+    def _calib_of(self, cam) -> dict:
+        """Intrinsics ``K`` + world pose for a camera object (NumPy)."""
+        from isaaclab.utils.math import matrix_from_quat
+
+        return {
+            "K": cam.data.intrinsic_matrices[0].detach().cpu().numpy(),
+            "pos": cam.data.pos_w[0].detach().cpu().numpy(),
+            "rot": matrix_from_quat(cam.data.quat_w_ros[0]).detach().cpu().numpy(),
+        }
+
     def _camera_calibration(self) -> dict:
-        """The camera's intrinsics ``K`` + world pose, captured ONCE and cached — the
-        analogue of a real camera's one-time (hand-eye) calibration.
+        """The overhead camera's intrinsics ``K`` + world pose, captured ONCE and
+        cached — the analogue of a real camera's one-time (hand-eye) calibration.
 
         Reading these here, once, is the *only* time the camera's geometry is taken
         from the simulator; every subsequent perception uses just the live image and
         this fixed calibration, so the bridge never asks the simulator *where things
-        are*. The overhead camera is static, so a single capture is exact."""
+        are*. The overhead camera is static, so a single capture is exact. (A wrist
+        camera moves with the arm, so its pose is re-read every frame — never cached
+        — in :meth:`_perceive_wrist`.)"""
         if self._cam_calib is None:
-            from isaaclab.utils.math import matrix_from_quat
-
-            cam = self._scene()["tiled_camera"]
-            self._cam_calib = {
-                "K": cam.data.intrinsic_matrices[0].detach().cpu().numpy(),
-                "pos": cam.data.pos_w[0].detach().cpu().numpy(),
-                "rot": matrix_from_quat(cam.data.quat_w_ros[0]).detach().cpu().numpy(),
-            }
+            self._cam_calib = self._calib_of(self._scene()[self.camera_name])
         return self._cam_calib
 
-    def _perceive(self) -> list[dict]:
-        """Detect graspable objects BY VISION from the overhead camera.
+    def _detect_from(self, cam, calib) -> list[dict]:
+        """Run the vision pipeline on one camera and return root-frame detections.
 
-        The ONLY inputs are the live camera image (+ depth) and the fixed camera
-        calibration (:meth:`_camera_calibration`); the robot's own base pose is used
-        purely to express the result in its control frame. NO object/scene
-        ground-truth is ever read — the bridge has no idea *what* or *where* things
-        are except by looking. Returns a list (largest blob first) of detections
-        with the centroid ``pixel``, blob ``pixels`` count, and the back-projected
-        ``world`` + robot-``root`` positions. Cached until the next sim step
-        (:meth:`_step`) so repeated state/cap reports don't re-run the pipeline.
-
-        Each blob is back-projected using the camera's per-pixel **depth** when the
-        camera provides it (``distance_to_image_plane``) — exact 3-D, robust to
-        objects of differing height — and falls back to intersecting the ray with
-        the ``table_z`` plane only when depth is unavailable.
+        Shared by the overhead view (:meth:`_perceive`) and the optional wrist view
+        (:meth:`_perceive_wrist`). The ONLY inputs are the live image (+ depth) and
+        the supplied calibration; the robot's base pose is used purely to express the
+        result in its control frame. NO object/scene ground-truth is read. Each blob
+        is back-projected with the camera's per-pixel **depth** when available
+        (``distance_to_image_plane`` — exact 3-D, robust to differing object height)
+        and falls back to the ``table_z`` plane intersection only when depth is not.
         """
-        if self._perceive_cache is not None:
-            return self._perceive_cache
-
-        cam = self._scene()["tiled_camera"]
         out = cam.data.output
         rgb = out["rgb"][0].detach().cpu().numpy()[..., :3].astype("float32")
         depth = None
@@ -225,7 +302,6 @@ class IsaacOpenArmEnv:
             if depth.ndim == 3:
                 depth = depth[..., 0]
         blobs = V.connected_blobs(V.foreground_mask(rgb, self.chroma_thresh))
-        calib = self._camera_calibration()
         K, cam_pos, cam_rot = calib["K"], calib["pos"], calib["rot"]
         t = self.torch
         robot = self._scene()["robot"]
@@ -252,10 +328,44 @@ class IsaacOpenArmEnv:
                 "root": [round(float(pb[0, 0]), 4), round(float(pb[0, 1]), 4),
                          round(float(pb[0, 2]), 4)],
             })
+        return dets
+
+    def _perceive(self) -> list[dict]:
+        """Detect graspable objects BY VISION from the overhead camera.
+
+        Returns a list (largest blob first) of detections with the centroid
+        ``pixel``, blob ``pixels`` count, and the back-projected ``world`` +
+        robot-``root`` positions. Cached until the next sim step (:meth:`_step`) so
+        repeated state/cap reports don't re-run the pipeline.
+        """
+        if self._perceive_cache is not None:
+            return self._perceive_cache
+
+        dets = self._detect_from(self._scene()[self.camera_name], self._camera_calibration())
         self._perceive_cache = dets
         print(f"[isaac_env] vision: detected {len(dets)} object(s): "
               f"{[(d['pixel'], d['src'], d['root']) for d in dets]}")
         return dets
+
+    def _perceive_wrist(self) -> list[dict]:
+        """Detect objects from the WRIST (eye-in-hand) camera, if one is configured.
+
+        Returns ``[]`` when no wrist camera is set up (the default) or when it sees
+        nothing / errors, so callers degrade gracefully to the overhead view. The
+        wrist camera moves with the arm, so its pose is read **fresh every call**
+        (never cached, unlike the static overhead calibration). Used to add a local,
+        close-range correction right before the grasp — the same trick the demo
+        video uses (switch to the right-wrist camera to centre the end-effector),
+        which beats trusting a single long-range overhead estimate."""
+        name = self.wrist_camera_name
+        if not name:
+            return []
+        try:
+            cam = self._scene()[name]
+            return self._detect_from(cam, self._calib_of(cam))
+        except Exception:
+            print(f"[isaac_env] wrist camera '{name}' unavailable:\n{traceback.format_exc()}")
+            return []
 
     def objects_world(self) -> dict:
         """Perceived object positions (robot ROOT frame) BY VISION, keyed generically
@@ -271,10 +381,69 @@ class IsaacOpenArmEnv:
         vec = [float(pos[0]), float(pos[1]), float(pos[2]), *self.grasp_quat, g]
         return t.tensor([vec] * self._num, dtype=t.float32, device=self.device)
 
-    def _goto(self, pos, gripper_open: bool, steps: int | None = None) -> None:
+    def _ee_body_name(self) -> str | None:
+        """Name of the controlled end-effector body, read once from the IK action
+        term's cfg (same source :meth:`capabilities` advertises) and cached."""
+        if self._ee_body is not None:
+            return self._ee_body or None
+        name = ""
+        try:
+            am = self.env.unwrapped.action_manager
+            for term_name in list(am.active_terms):
+                term = am.get_term(term_name) if hasattr(am, "get_term") else None
+                cfg = getattr(term, "cfg", None)
+                body = getattr(cfg, "body_name", None) if cfg is not None else None
+                if body:
+                    name = body
+                    break
+        except Exception:
+            name = ""
+        self._ee_body = name
+        return name or None
+
+    def _tcp_pos(self) -> list | None:
+        """Live end-effector position in the robot ROOT frame, or ``None`` if it
+        can't be read.
+
+        This is proprioception (the arm's own forward kinematics), the same category
+        as gripper width — NOT object/scene ground truth — and is used only to tell
+        whether a commanded waypoint has been reached (see :meth:`_goto`)."""
+        body = self._ee_body_name()
+        if not body:
+            return None
+        try:
+            robot = self._scene()["robot"]
+            names = list(robot.data.body_names)
+            if body not in names:
+                return None
+            idx = names.index(body)
+            pw = robot.data.body_pos_w[:, idx, :]
+            pb, _ = self._sub(robot.data.root_pos_w, robot.data.root_quat_w, pw)
+            return [float(pb[0, 0]), float(pb[0, 1]), float(pb[0, 2])]
+        except Exception:
+            return None
+
+    def _goto(self, pos, gripper_open: bool, steps: int | None = None,
+              tol: float | None = None) -> bool:
+        """Drive the TCP toward ``pos``, stopping early once within ``tol`` of it.
+
+        Differential-IK converges over several steps, so each waypoint is held for
+        up to ``steps`` (default :attr:`steps_per_move`) sim steps — but as soon as
+        the TCP is within ``tol`` metres (default :attr:`pos_tol`) the move returns,
+        rather than wasting the rest of the budget or over-driving past the target.
+        Pass ``tol=0`` to disable the early-exit (e.g. the gripper open/close settle,
+        which isn't a TCP move). Returns whether the target was reached within
+        tolerance (always ``False`` when the early-exit is disabled or the TCP is
+        unreadable — callers that don't care just ignore it)."""
         action = self._ik_action(pos, gripper_open)
+        tol = self.pos_tol if tol is None else tol
+        reached = False
         for _ in range(steps or self.steps_per_move):
             self._step(action)
+            if tol and tol > 0 and _within_tol(self._tcp_pos(), pos, tol):
+                reached = True
+                break
+        return reached
 
     # -------------------------------------------------------------- skills
     def execute(self, req: "P.ArmActionRequest") -> dict:
@@ -359,13 +528,32 @@ class IsaacOpenArmEnv:
               f"root={best['root']} pixel={best['pixel']} pixels={best['pixels']}")
         return list(best["root"])
 
+    def _refine_with_wrist(self, p: list) -> list:
+        """Refine an above-the-target grasp point using the wrist (eye-in-hand)
+        camera, if one is configured. Corrects only the lateral (x, y) centring —
+        the local close-range view removes most of the overhead camera's
+        perspective error — and keeps the depth/overhead z. Returns ``p`` unchanged
+        when no wrist camera is set up or it sees nothing (graceful fallback)."""
+        dets = self._perceive_wrist()
+        if not dets:
+            return p
+        best = min(dets, key=lambda d: (d["root"][0] - p[0]) ** 2 + (d["root"][1] - p[1]) ** 2)
+        refined = [best["root"][0], best["root"][1], p[2]]
+        print(f"[isaac_env] wrist refine: {p} -> {refined} "
+              f"(pixel={best['pixel']} src={best['src']})")
+        return refined
+
     def _pick(self, xyz: list) -> bool:
-        p = self._grasp_point(xyz)  # exact grasp point comes from vision
-        above = [p[0], p[1], p[2] + self.approach_z]
+        p = self._grasp_point(xyz)  # approximate grasp point from the overhead camera
+        # Move above the target first, then — once there — take a local wrist-camera
+        # look to centre on it (eye-in-hand correction), exactly the two-stage
+        # strategy the demo uses to beat single-shot long-range overhead estimates.
+        self._goto([p[0], p[1], p[2] + self.approach_z], gripper_open=True)
+        p = self._refine_with_wrist(p)
         grasp = [p[0], p[1], p[2] + self.grasp_z]
-        self._goto(above, gripper_open=True)
+        self._goto([p[0], p[1], p[2] + self.approach_z], gripper_open=True)
         self._goto(grasp, gripper_open=True)
-        self._goto(grasp, gripper_open=False, steps=self.settle_steps)  # close
+        self._goto(grasp, gripper_open=False, steps=self.settle_steps, tol=0.0)  # close
         lift = [p[0], p[1], p[2] + self.lift_z]
         self._goto(lift, gripper_open=False)
         # Proprioceptive success: after closing, an object wedges the fingers open.
@@ -380,7 +568,7 @@ class IsaacOpenArmEnv:
         drop = [xyz[0], xyz[1], xyz[2] + self.grasp_z + 0.04]
         self._goto(above, gripper_open=False)
         self._goto(drop, gripper_open=False)
-        self._goto(drop, gripper_open=True, steps=self.settle_steps)  # release
+        self._goto(drop, gripper_open=True, steps=self.settle_steps, tol=0.0)  # release
         self._goto(above, gripper_open=True)
         self._holding = False
         return True
@@ -451,7 +639,11 @@ class IsaacOpenArmEnv:
             },
             "skills": SKILLS,
             "objects": self.objects_world(),
-            "camera": {"width": self.CAM_W, "height": self.CAM_H},
+            "obstacles": self.obstacles,
+            "camera": {"width": self.CAM_W, "height": self.CAM_H,
+                       "name": self.camera_name,
+                       "wrist": self.wrist_camera_name or None},
+            "control": {"pos_tol": self.pos_tol},
         }
 
     # ------------------------------------------------------------- camera
@@ -460,7 +652,7 @@ class IsaacOpenArmEnv:
 
         from PIL import Image
 
-        rgb = self._scene()["tiled_camera"].data.output["rgb"][0]
+        rgb = self._scene()[self.camera_name].data.output["rgb"][0]
         arr = rgb.detach().cpu().numpy()[..., :3].astype("uint8")
         self.CAM_H, self.CAM_W = int(arr.shape[0]), int(arr.shape[1])
         buf = io.BytesIO()
