@@ -34,21 +34,28 @@ from . import vision as V
 
 # Skills the bridge implements on top of the arm's primitive action types. They are
 # deliberately object-agnostic — the bridge knows nothing about *what* it is
-# manipulating, so this generalizes beyond any particular scene. Coordinates are in
-# the robot ROOT frame; the agent gets candidate object positions from the vision
-# snapshot (arm_describe / arm_get_scene "objects", detected by camera) and never
-# refers to objects by a hardcoded name/identity.
+# manipulating, so this generalizes beyond any particular scene. The agent is NEVER
+# handed object positions: it looks at the live camera frame (arm_get_camera) and
+# names a target by the image pixel (px, py) it sees there; the bridge back-projects
+# that pixel through the camera. Root-frame (x, y) remains a low-level escape hatch.
 SKILLS = [
-    {"name": "pick", "args": {"x": "float", "y": "float", "z": "float?"},
+    {"name": "pick", "args": {"px": "float", "py": "float",
+                              "x": "float?", "y": "float?", "z": "float?"},
      "grasping": True,
-     "desc": "grasp the object nearest root-frame (x, y) and lift it; the robot "
-             "pinpoints the exact grasp point by vision (overhead camera, plus a "
-             "local wrist-camera re-centre when one is configured), so (x, y) need "
-             "only be approximate"},
-    {"name": "place_at", "args": {"x": "float", "y": "float"},
-     "desc": "place the currently-held object at root-frame (x, y)"},
-    {"name": "move_above", "args": {"x": "float", "y": "float"},
-     "desc": "move the end-effector above root-frame (x, y)"},
+     "desc": "grasp the object at image pixel (px, py) — the pixel you read off the "
+             "camera frame — and lift it. The bridge back-projects the pixel through "
+             "the camera and pinpoints the exact grasp point by vision (overhead "
+             "camera, plus a local wrist-camera re-centre when one is configured), so "
+             "the pixel need only land on the object. (Advanced: root-frame x, y may "
+             "be given instead of a pixel.)"},
+    {"name": "place_at", "args": {"px": "float", "py": "float",
+                                  "x": "float?", "y": "float?"},
+     "desc": "place the currently-held object at image pixel (px, py) read off the "
+             "camera frame (back-projected through the camera; or root-frame x, y)"},
+    {"name": "move_above", "args": {"px": "float", "py": "float",
+                                    "x": "float?", "y": "float?"},
+     "desc": "move the end-effector above image pixel (px, py) read off the camera "
+             "frame (back-projected through the camera; or root-frame x, y)"},
     {"name": "raw", "args": {"actions": "list[float vectors]"},
      "desc": "replay low-level action vectors matching action_space.dof"},
 ]
@@ -367,11 +374,40 @@ class IsaacOpenArmEnv:
             print(f"[isaac_env] wrist camera '{name}' unavailable:\n{traceback.format_exc()}")
             return []
 
-    def objects_world(self) -> dict:
-        """Perceived object positions (robot ROOT frame) BY VISION, keyed generically
-        (obj0, obj1, … largest blob first). No ground-truth scene state — this is the
-        situational awareness the agent uses to choose a pick coordinate."""
-        return {f"obj{i}": d["root"] for i, d in enumerate(self._perceive())}
+    def _pixel_to_root(self, u: float, v: float) -> list:
+        """Back-project an image pixel ``(u, v)`` through the overhead camera to a
+        robot ROOT-frame target.
+
+        This is how the agent points at a target *through the camera*: it reads the
+        pixel off the live camera image (``arm_get_camera``) and the bridge converts
+        it with the camera's own geometry — exactly the inverse of how the frame was
+        formed. Object positions in the scene are **never** handed to the agent; it
+        only ever sees the picture and names a pixel in it. Uses the per-pixel depth
+        when the camera provides it, else intersects the ray with the ``table_z``
+        plane. Raises if the pixel can't be back-projected (off-table ray)."""
+        calib = self._camera_calibration()
+        K, cam_pos, cam_rot = calib["K"], calib["pos"], calib["rot"]
+        out = self._scene()[self.camera_name].data.output
+        pw = None
+        if "distance_to_image_plane" in out:
+            depth = out["distance_to_image_plane"][0].detach().cpu().numpy()
+            if depth.ndim == 3:
+                depth = depth[..., 0]
+            vi, ui = int(round(v)), int(round(u))
+            if 0 <= vi < depth.shape[0] and 0 <= ui < depth.shape[1]:
+                pw = V.pixel_to_point_with_depth(u, v, float(depth[vi, ui]),
+                                                 K, cam_pos, cam_rot)
+        if pw is None:
+            pw = V.pixel_to_table_point(u, v, K, cam_pos, cam_rot, self.table_z)
+        if pw is None:
+            raise ValueError(f"could not back-project pixel ({u}, {v}) through the camera")
+        t = self.torch
+        robot = self._scene()["robot"]
+        pwt = t.tensor([pw], dtype=t.float32, device=self.device)
+        pb, _ = self._sub(robot.data.root_pos_w, robot.data.root_quat_w, pwt)
+        root = [round(float(pb[0, 0]), 4), round(float(pb[0, 1]), 4), round(float(pb[0, 2]), 4)]
+        print(f"[isaac_env] pixel ({u},{v}) -> root {root}")
+        return root
 
     # --------------------------------------------------------- IK stepping
     def _ik_action(self, pos, gripper_open: bool):
@@ -505,14 +541,21 @@ class IsaacOpenArmEnv:
         raise ValueError(f"unknown skill '{cmd}'")
 
     def _target_xyz(self, args: dict):
-        """Resolve a coordinate target to a robot-root-frame [x, y, z] list.
+        """Resolve a target to a robot-root-frame [x, y, z] list.
 
-        Object-agnostic: the agent supplies the coordinates (from its own
-        perception of the camera frame), the bridge just executes them."""
+        The primary, vision-grounded way the agent names a target is an **image
+        pixel** ``(px, py)`` it read off the camera frame — the bridge back-projects
+        it *through the camera* (:meth:`_pixel_to_root`); the agent is never handed
+        object positions. Root-frame ``x, y`` is still accepted as a low-level
+        escape hatch (e.g. raw/advanced control), but the advertised skills steer
+        the agent to pixels."""
+        if "px" in args and "py" in args:
+            return self._pixel_to_root(float(args["px"]), float(args["py"]))
         if "x" in args and "y" in args:
             z = float(args["z"]) if args.get("z") is not None else self.table_z
             return [float(args["x"]), float(args["y"]), z]
-        raise ValueError("target needs 'x' and 'y' (and optionally 'z')")
+        raise ValueError("target needs an image pixel 'px','py' (read off the camera "
+                         "frame) — or root-frame 'x','y' for low-level control")
 
     def _grasp_point(self, xyz: list) -> list:
         """Refine an approximate target to the nearest VISION-detected object (robot
@@ -588,15 +631,17 @@ class IsaacOpenArmEnv:
                 "object_height": None}
 
     def metrics(self) -> dict:
+        # Proprioception only (held? / gripper width). Object positions are NOT
+        # reported: the agent perceives objects by looking at the camera frame, it
+        # is never handed scene coordinates (see _pixel_to_root / arm_get_camera).
         grasp = self._grasp_metrics()
-        grasp["objects"] = self.objects_world()
         grasp["holding"] = bool(self._holding)
         return grasp
 
     def _report(self, command: str, ok: bool, error: str = "") -> dict:
         m = self.metrics()
         return {"command": command, "ok": ok, "error": error,
-                "holding": bool(self._holding), "objects": m["objects"],
+                "holding": bool(self._holding),
                 "grasp": {k: m[k] for k in ("grasped", "gripper_width", "object_height")}}
 
     # ------------------------------------------------------- capabilities
@@ -638,7 +683,10 @@ class IsaacOpenArmEnv:
                 "pose_format": "[px,py,pz,qw,qx,qy,qz] in robot root frame",
             },
             "skills": SKILLS,
-            "objects": self.objects_world(),
+            # No "objects" list: the agent is never handed scene object positions.
+            # It perceives objects by looking at the camera frame (arm_get_camera)
+            # and names a target by image pixel (px, py), which the bridge
+            # back-projects through the camera.
             "obstacles": self.obstacles,
             "camera": {"width": self.CAM_W, "height": self.CAM_H,
                        "name": self.camera_name,

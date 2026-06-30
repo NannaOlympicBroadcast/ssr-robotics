@@ -9,8 +9,9 @@ in-process :class:`ssr.bus.core.MessageBus` and the remote
   (so the agent discovers the supported action types / skills at runtime);
 * serves ``arm.action.execute`` by invoking the requested skill on the env, then
   publishes a completion event (``arm.grasp.completed`` for grasping skills,
-  else ``arm.action.completed``) carrying the result + scene snapshot + camera
-  frame.
+  else ``arm.action.completed``) carrying the result + proprioception + camera
+  frame (never object positions — the agent perceives those from the frame);
+* answers ``arm.camera.request`` with a fresh camera frame (+ proprioception).
 
 The env must implement: ``reset()``, ``execute(req) -> dict``,
 ``metrics() -> dict``, ``capabilities() -> dict``, ``frame() -> bytes`` and the
@@ -52,7 +53,7 @@ class EnvRunner:
         self._subs.append(self.bus.subscribe(P.TOPIC_CAPS_REQUEST, self._on_caps))
         self._subs.append(self.bus.subscribe(P.TOPIC_ACTION_EXECUTE, self._on_execute))
         self._subs.append(self.bus.subscribe(P.TOPIC_RESET, self._on_reset))
-        self._subs.append(self.bus.subscribe(P.TOPIC_STATE_REQUEST, self._on_state_request))
+        self._subs.append(self.bus.subscribe(P.TOPIC_CAMERA_REQUEST, self._on_camera_request))
         # Advertise capabilities once on startup too. start() is called from the
         # main/sim thread before the event loop begins, so this direct call is safe.
         self._publish_caps()
@@ -131,7 +132,7 @@ class EnvRunner:
             try:
                 self.env.reset()
                 snap = self.env.metrics()
-                self._publish(P.TOPIC_STATE, {**snap, **self._frame_fields()})
+                self._publish(P.TOPIC_CAMERA, {**snap, **self._frame_fields()})
                 print("[env_runner] reset: done")
             except Exception:
                 self._log_exc("reset")
@@ -149,13 +150,16 @@ class EnvRunner:
                 break
         return dropped
 
-    def _on_state_request(self, ev) -> None:
+    def _on_camera_request(self, ev) -> None:
+        # Fetch a fresh camera frame (+ the arm's own proprioception). This is the
+        # only "look" path; it never includes object positions — the agent perceives
+        # objects from the frame itself.
         def _job() -> None:
             try:
                 snap = self.env.metrics()
-                self._publish(P.TOPIC_STATE, {**snap, **self._frame_fields()})
+                self._publish(P.TOPIC_CAMERA, {**snap, **self._frame_fields()})
             except Exception:
-                self._log_exc("state request")
+                self._log_exc("camera request")
 
         self._jobs.put(_job)
 

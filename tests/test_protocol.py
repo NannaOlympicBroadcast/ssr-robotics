@@ -101,12 +101,12 @@ def test_reset_interrupts_and_drains_queued_jobs():
         bus.publish(P.TOPIC_ACTION_EXECUTE, req.to_payload())
 
     done = threading.Event()
-    bus.subscribe(P.TOPIC_STATE, lambda ev: done.set())
+    bus.subscribe(P.TOPIC_CAMERA, lambda ev: done.set())
     bus.publish(P.TOPIC_RESET, {"episode": 2})
 
     assert env.interrupted is True            # in-flight skill asked to stop
     assert runner.pump(timeout=2.0)           # next job out of the queue is the reset
-    assert done.wait(2.0)                      # ...which published fresh state
+    assert done.wait(2.0)                      # ...which published a fresh camera frame
     assert runner.pump(timeout=0.2) is False  # the two execute jobs were dropped
     runner.stop()
 
