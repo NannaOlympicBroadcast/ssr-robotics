@@ -11,7 +11,10 @@ in-process :class:`ssr.bus.core.MessageBus` and the remote
   publishes a completion event (``arm.grasp.completed`` for grasping skills,
   else ``arm.action.completed``) carrying the result + proprioception + camera
   frame (never object positions — the agent perceives those from the frame);
-* answers ``arm.camera.request`` with a fresh camera frame (+ proprioception).
+* answers ``arm.camera.request`` with a fresh camera frame (+ proprioception);
+* serves ``arm.record.start`` / ``arm.record.stop`` (recording any advertised
+  camera), acking on ``arm.record.started`` and returning the encoded video on
+  ``arm.record.saved``.
 
 The env must implement: ``reset()``, ``execute(req) -> dict``,
 ``metrics() -> dict``, ``capabilities() -> dict``, ``frame() -> bytes`` and the
@@ -54,6 +57,8 @@ class EnvRunner:
         self._subs.append(self.bus.subscribe(P.TOPIC_ACTION_EXECUTE, self._on_execute))
         self._subs.append(self.bus.subscribe(P.TOPIC_RESET, self._on_reset))
         self._subs.append(self.bus.subscribe(P.TOPIC_CAMERA_REQUEST, self._on_camera_request))
+        self._subs.append(self.bus.subscribe(P.TOPIC_RECORD_START, self._on_record_start))
+        self._subs.append(self.bus.subscribe(P.TOPIC_RECORD_STOP, self._on_record_stop))
         # Advertise capabilities once on startup too. start() is called from the
         # main/sim thread before the event loop begins, so this direct call is safe.
         self._publish_caps()
@@ -160,6 +165,36 @@ class EnvRunner:
                 self._publish(P.TOPIC_CAMERA, {**snap, **self._frame_fields()})
             except Exception:
                 self._log_exc("camera request")
+
+        self._jobs.put(_job)
+
+    def _on_record_start(self, ev) -> None:
+        # Recording start is queued like any env job, so a "start recording, then
+        # execute the skill" sequence from the brain runs in order on the sim thread
+        # — the recording is live before the motion begins.
+        payload = dict(ev.payload or {})
+
+        def _job() -> None:
+            try:
+                res = self.env.start_recording(
+                    camera=str(payload.get("camera") or ""),
+                    every=payload.get("every"),
+                    max_frames=payload.get("max_frames"))
+            except Exception:
+                self._log_exc("record start")
+                res = {"ok": False, "error": "record start failed (see bridge log)"}
+            self._publish(P.TOPIC_RECORD_STARTED, res)
+
+        self._jobs.put(_job)
+
+    def _on_record_stop(self, ev) -> None:
+        def _job() -> None:
+            try:
+                res = self.env.stop_recording()
+            except Exception:
+                self._log_exc("record stop")
+                res = {"ok": False, "error": "record stop failed (see bridge log)"}
+            self._publish(P.TOPIC_RECORD_SAVED, res)
 
         self._jobs.put(_job)
 

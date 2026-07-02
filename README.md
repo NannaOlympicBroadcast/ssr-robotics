@@ -63,10 +63,20 @@ vars, so no code edit is needed):
 
 * **Overhead camera too high / wrong angle.** Back-projecting 2-D pixels from a
   high, oblique view carries a large perspective error, so the arm grasps off to
-  the side. Lower the camera (smaller Z) and zoom it onto the working area in the
-  scene; if you add a closer camera prim, point the bridge at it with
-  `SSR_ARM_CAMERA=<prim_name>` (default `tiled_camera`). Depth-based
-  back-projection is already preferred over the table-plane fallback.
+  the side. The bridge now **repositions the main camera itself** at startup and
+  after every reset: a front-side elevated view (default position `1.0, 0.8, 0.9`
+  looking at `0.4, 0.0, 0.05`, relative to the robot's env origin) that frames the
+  arm and the whole tabletop. Tune with `SSR_ARM_CAM_POS` / `SSR_ARM_CAM_TARGET`
+  (`"x,y,z"`), or set `SSR_ARM_CAM_POS=keep` to leave the scene's own placement.
+  A different camera prim can be selected with `SSR_ARM_CAMERA=<prim_name>`
+  (default `tiled_camera`). Depth-based back-projection is already preferred over
+  the table-plane fallback.
+* **Debug markers polluting the camera.** Isaac Lab's debug visualizations (the
+  RGB axis arrows of the IK target / goal frames) render **into the camera
+  image**, wrecking both the vision pipeline and the agent looking at the frame.
+  The bridge disables every `debug_vis` flag it finds on the env cfg and switches
+  the live managers' visualizers off after creation. Set `SSR_ARM_DEBUG_VIS=1` to
+  keep the markers for human debugging.
 * **Single long-range estimate.** Set `SSR_ARM_WRIST_CAMERA=<prim_name>` to enable
   an **eye-in-hand** correction: `pick` moves above the target from the overhead
   estimate, then re-centres laterally on the object using the wrist camera before
@@ -81,6 +91,18 @@ vars, so no code edit is needed):
   `0.01` m) is the "arrived" radius: once the end-effector TCP is within it the
   move stops early instead of burning steps or over-driving. Widen it if moves are
   judged failed; tighten it for finer placement.
+
+## Camera recording (review & reflect)
+
+Any advertised camera (main or wrist) can be recorded over the bus:
+`arm.record.start` `{camera, every?, max_frames?}` begins buffering every Nth sim
+step's frame (defaults: every 5th step, 500-frame cap — overruns are counted and
+reported, never silent); `arm.record.stop` encodes the buffer (MP4 via
+imageio+ffmpeg when installed, else an animated GIF via Pillow) and publishes it
+on `arm.record.saved` (`video_b64`, `format`, `fps`, `frames`, `dropped`). The
+brain-side `arm_record_start` / `arm_record_stop` tools wrap these and save the
+video locally so the agent can **review the whole motion and reflect** — far more
+signal than a single after-the-fact frame.
 
 ## Tests (no GPU)
 

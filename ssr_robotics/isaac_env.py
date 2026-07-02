@@ -102,6 +102,20 @@ POS_TOL = 0.01
 # via SSR_ARM_WRIST_CAMERA to enable a local close-range grasp refinement pass.
 CAMERA_NAME = "tiled_camera"
 
+# Default main-camera pose: a front-side elevated view (relative to the robot's env
+# origin, world up), placed off the table's front corner and looking down at the
+# workspace so BOTH the arm and the whole tabletop are in frame — instead of the
+# scene's default straight-down overhead placement. Overridable via
+# SSR_ARM_CAM_POS / SSR_ARM_CAM_TARGET ("x,y,z"); set SSR_ARM_CAM_POS=keep to leave
+# the scene's own camera pose untouched.
+CAM_POS = (1.0, 0.8, 0.9)
+CAM_TARGET = (0.4, 0.0, 0.05)
+
+# Recording defaults: capture every Nth sim step, hard cap on buffered frames (a
+# 320x240 RGB frame is ~230 KB; 500 frames ≈ 35 s of a pick-and-place run).
+RECORD_EVERY = 5
+RECORD_MAX_FRAMES = 500
+
 
 def _env_float(name: str, default: float) -> float:
     """Read a float override from the environment, ignoring blank/garbage values."""
@@ -112,6 +126,52 @@ def _env_float(name: str, default: float) -> float:
         return float(raw) if raw.strip() else default
     except (TypeError, ValueError):
         return default
+
+
+def _parse_vec3(raw) -> tuple | None:
+    """Parse an ``"x,y,z"`` string into a 3-tuple of floats.
+
+    Returns ``None`` for blank/garbage/wrong-arity input (callers then fall back to
+    their default) and for the explicit sentinel ``"keep"`` (leave the scene's own
+    camera pose untouched)."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s or s.lower() == "keep":
+        return None
+    try:
+        parts = [float(p) for p in s.split(",")]
+    except (TypeError, ValueError):
+        return None
+    return tuple(parts) if len(parts) == 3 else None
+
+
+def _disable_debug_vis_cfg(env_cfg) -> int:
+    """Turn off every ``debug_vis`` flag found on the env cfg's action / command /
+    observation / scene term configs, BEFORE the env is built.
+
+    The red/green/blue arrow markers the camera was seeing are Isaac Lab debug
+    visualizations (the IK action term's target-pose frame, goal-command frames,
+    sensor frames). They are drawn into the render product, so the robot's camera
+    "hallucinates" giant axes floating over the scene — killing the vision
+    pipeline's chroma segmentation and confusing the agent looking at the frame.
+    Returns how many flags were cleared. Defensive: unknown cfg layouts are skipped
+    rather than raised on."""
+    cleared = 0
+    for group_name in ("actions", "commands", "observations", "scene", "rewards",
+                       "terminations", "events"):
+        group = getattr(env_cfg, group_name, None)
+        if group is None:
+            continue
+        entries = list(vars(group).values()) if hasattr(group, "__dict__") else []
+        for obj in [group, *entries]:
+            try:
+                if getattr(obj, "debug_vis", None) is True:
+                    obj.debug_vis = False
+                    cleared += 1
+            except Exception:
+                continue
+    return cleared
 
 
 def _within_tol(current, target, tol: float) -> bool:
@@ -169,7 +229,8 @@ class IsaacOpenArmEnv:
                  table_z: float | None = None, chroma_thresh: float | None = None,
                  grip_hold_eps: float | None = None, pos_tol: float | None = None,
                  camera: str | None = None, wrist_camera: str | None = None,
-                 obstacles=None):
+                 obstacles=None, cam_pos=None, cam_target=None,
+                 debug_vis: bool | None = None):
         import os
 
         import gymnasium as gym
@@ -210,12 +271,39 @@ class IsaacOpenArmEnv:
         # Obstacles advertised to the brain's planner as collision bodies to avoid.
         self.obstacles = (_parse_obstacles(os.environ.get("SSR_ARM_OBSTACLES", ""))
                           if obstacles is None else list(obstacles))
+        # Main-camera pose (env-origin-relative "x,y,z"): front-side elevated view by
+        # default so the frame shows the arm AND the whole tabletop. cam_pos=None →
+        # SSR_ARM_CAM_POS → module default; the "keep" sentinel (or cam_pos=())
+        # leaves the scene's own camera placement untouched.
+        if cam_pos is None:
+            self.cam_pos = _parse_vec3(os.environ.get("SSR_ARM_CAM_POS", "")) \
+                if os.environ.get("SSR_ARM_CAM_POS", "").strip() else CAM_POS
+        else:
+            self.cam_pos = tuple(cam_pos) if cam_pos else None
+        if cam_target is None:
+            self.cam_target = _parse_vec3(os.environ.get("SSR_ARM_CAM_TARGET", "")) or CAM_TARGET
+        else:
+            self.cam_target = tuple(cam_target) if cam_target else CAM_TARGET
+        # Recording state (see start_recording / stop_recording / _record_tick).
+        self._rec: dict | None = None
         # The `env_cfg_entry_point` gym.make() is registered with is inert metadata —
         # Isaac Lab requires resolving it into a real cfg instance first. This also
         # forces num_envs=1: the task's registered default is RL-training scale
         # (e.g. 4096), but this bridge drives a single real/simulated arm.
         env_cfg = parse_env_cfg(task, num_envs=num_envs)
+        # Hide the debug axis markers (IK target / goal frames) from the camera —
+        # they render into the camera image and wreck vision. SSR_ARM_DEBUG_VIS=1
+        # (or debug_vis=True) keeps them for human debugging.
+        keep_vis = (os.environ.get("SSR_ARM_DEBUG_VIS", "").strip() in
+                    ("1", "true", "yes")) if debug_vis is None else bool(debug_vis)
+        self.debug_vis = keep_vis
+        if not keep_vis:
+            n = _disable_debug_vis_cfg(env_cfg)
+            print(f"[isaac_env] debug_vis: cleared {n} cfg flag(s) so markers don't "
+                  "render into the camera")
         self.env = gym.make(task, cfg=env_cfg, render_mode="rgb_array")
+        if not keep_vis:
+            self._disable_debug_vis_runtime()
         self.device = self.env.unwrapped.device
         cam = self.env.unwrapped.scene[self.camera_name]
         self.CAM_H, self.CAM_W = int(cam.image_shape[0]), int(cam.image_shape[1])
@@ -242,7 +330,9 @@ class IsaacOpenArmEnv:
         """Advance the sim one step and invalidate the perception cache (the scene
         moved, so any cached detection is now stale)."""
         self._perceive_cache = None
-        return self.env.step(action)
+        out = self.env.step(action)
+        self._record_tick()
+        return out
 
     def interrupt(self) -> None:
         """Ask an in-flight multi-step skill (e.g. a raw replay) to stop ASAP.
@@ -251,11 +341,71 @@ class IsaacOpenArmEnv:
         ``env.step``, but it lets a reset preempt a long/runaway replay."""
         self._interrupt.set()
 
+    def _disable_debug_vis_runtime(self) -> None:
+        """Belt-and-braces: also switch off debug visualization on the live managers
+        after the env is built. Some marker visualizers are created regardless of the
+        cfg flag and toggled at runtime via ``set_debug_vis`` — without this the
+        camera keeps seeing the RGB axis arrows over the scene."""
+        base = self.env.unwrapped
+        for mgr_name in ("action_manager", "command_manager", "observation_manager"):
+            mgr = getattr(base, mgr_name, None)
+            if mgr is None:
+                continue
+            try:
+                mgr.set_debug_vis(False)
+            except Exception:
+                pass  # a manager without visualizers may not implement the toggle
+        try:
+            for sensor in getattr(self._scene(), "sensors", {}).values():
+                try:
+                    sensor.set_debug_vis(False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _position_camera(self) -> None:
+        """Place the main camera at the configured pose (front-side elevated view
+        seeing the arm + whole tabletop) instead of the scene's default placement.
+
+        ``cam_pos``/``cam_target`` are relative to the robot's env origin (world up),
+        so the same numbers work regardless of where the env is spawned. No-op when
+        the pose was explicitly set to "keep". Re-applied after every reset (a scene
+        reset may restore the USD default pose), and the cached calibration is
+        invalidated so the next perception re-reads the camera's true geometry."""
+        if not self.cam_pos:
+            return
+        t = self.torch
+        try:
+            cam = self._scene()[self.camera_name]
+            try:
+                origin = self._scene().env_origins[0].detach().cpu().numpy()
+            except Exception:
+                origin = (0.0, 0.0, 0.0)
+            eye = [float(a) + float(b) for a, b in zip(self.cam_pos, origin)]
+            target = [float(a) + float(b) for a, b in zip(self.cam_target, origin)]
+            quat = V.look_at_quat_ros(eye, target)
+            pos_t = t.tensor([eye], dtype=t.float32, device=self.device)
+            quat_t = t.tensor([list(quat)], dtype=t.float32, device=self.device)
+            cam.set_world_poses(pos_t, quat_t, convention="ros")
+            try:
+                cam.update(0.0)  # refresh cam.data so the new pose is visible now
+            except Exception:
+                pass
+            self._cam_calib = None       # geometry changed — recalibrate lazily
+            self._perceive_cache = None
+            print(f"[isaac_env] camera '{self.camera_name}' placed at {eye} "
+                  f"looking at {target}")
+        except Exception:
+            print(f"[isaac_env] camera positioning failed (keeping scene pose):\n"
+                  f"{traceback.format_exc()}")
+
     # ------------------------------------------------------------------ env
     def reset(self, target: str | None = None) -> None:
         self._interrupt.clear()
         self._perceive_cache = None
         self.env.reset()
+        self._position_camera()
         self._holding = False
 
     def _scene(self):
@@ -644,6 +794,104 @@ class IsaacOpenArmEnv:
                 "holding": bool(self._holding),
                 "grasp": {k: m[k] for k in ("grasped", "gripper_width", "object_height")}}
 
+    # ------------------------------------------------------------ recording
+    def recordable_cameras(self) -> list:
+        """Names of the cameras a recording may target (main + wrist if set)."""
+        cams = [self.camera_name]
+        if self.wrist_camera_name:
+            cams.append(self.wrist_camera_name)
+        return cams
+
+    def start_recording(self, camera: str = "", every: int | None = None,
+                        max_frames: int | None = None) -> dict:
+        """Begin buffering frames from ``camera`` (default: the main camera).
+
+        Every ``every``-th sim step's frame is captured (the sim only renders on
+        steps, so that is the natural sampling clock), up to ``max_frames`` buffered
+        frames — beyond that new frames are dropped and counted, never silently. A
+        second start while recording restarts fresh (the old buffer is discarded,
+        loudly). Frames are grabbed in :meth:`_record_tick`, on the sim thread."""
+        cam = (camera or "").strip() or self.camera_name
+        if cam not in self.recordable_cameras():
+            return {"ok": False,
+                    "error": f"unknown camera '{cam}' — available: "
+                             f"{', '.join(self.recordable_cameras())}"}
+        if self._rec is not None:
+            print(f"[isaac_env] record: restarting (discarding "
+                  f"{len(self._rec['frames'])} buffered frame(s))")
+        self._rec = {
+            "camera": cam,
+            "every": max(1, int(every or RECORD_EVERY)),
+            "max": max(1, int(max_frames or RECORD_MAX_FRAMES)),
+            "frames": [], "tick": 0, "dropped": 0,
+        }
+        print(f"[isaac_env] record: started on '{cam}' "
+              f"(every {self._rec['every']} steps, cap {self._rec['max']} frames)")
+        return {"ok": True, "camera": cam, "every": self._rec["every"],
+                "max_frames": self._rec["max"]}
+
+    def _record_tick(self) -> None:
+        """Capture the current frame into the recording buffer (called from
+        :meth:`_step`, i.e. always on the sim thread). Never raises — a capture
+        hiccup must not break the motion that is being recorded."""
+        rec = self._rec
+        if rec is None:
+            return
+        rec["tick"] += 1
+        if rec["tick"] % rec["every"]:
+            return
+        if len(rec["frames"]) >= rec["max"]:
+            rec["dropped"] += 1
+            return
+        try:
+            rgb = self._scene()[rec["camera"]].data.output["rgb"][0]
+            rec["frames"].append(rgb.detach().cpu().numpy()[..., :3].astype("uint8"))
+        except Exception:
+            rec["dropped"] += 1
+
+    def stop_recording(self) -> dict:
+        """Stop recording and encode the buffered frames into a video.
+
+        Prefers MP4 (imageio + ffmpeg, when installed); falls back to an animated
+        GIF via Pillow, which is always available in the Isaac extra — so recording
+        degrades gracefully rather than requiring ffmpeg. Returns the encoded video
+        as ``video_b64`` plus metadata; the caller (EnvRunner) ships it over the bus
+        so the brain can save and review it."""
+        import base64
+        import io
+
+        rec, self._rec = self._rec, None
+        if rec is None:
+            return {"ok": False, "error": "not recording"}
+        frames = rec["frames"]
+        if not frames:
+            return {"ok": False, "error": "recording captured no frames "
+                                          "(was the arm ever stepped?)",
+                    "camera": rec["camera"], "dropped": rec["dropped"]}
+        step_dt = float(getattr(self.env.unwrapped, "step_dt", 1.0 / 60.0))
+        fps = max(1, min(30, round(1.0 / (rec["every"] * step_dt))))
+        fmt, data = "mp4", None
+        try:
+            import imageio.v3 as iio  # needs imageio + imageio-ffmpeg
+
+            data = iio.imwrite("<bytes>", frames, extension=".mp4", fps=fps)
+        except Exception:
+            from PIL import Image
+
+            imgs = [Image.fromarray(f) for f in frames]
+            buf = io.BytesIO()
+            imgs[0].save(buf, format="GIF", save_all=True, append_images=imgs[1:],
+                         duration=int(1000 / fps), loop=0)
+            fmt, data = "gif", buf.getvalue()
+        if rec["dropped"]:
+            print(f"[isaac_env] record: dropped {rec['dropped']} frame(s) "
+                  f"(cap {rec['max']})")
+        print(f"[isaac_env] record: stopped — {len(frames)} frames -> "
+              f"{fmt} ({len(data)} bytes, {fps} fps)")
+        return {"ok": True, "camera": rec["camera"], "format": fmt, "fps": fps,
+                "frames": len(frames), "dropped": rec["dropped"],
+                "video_b64": base64.b64encode(data).decode("ascii")}
+
     # ------------------------------------------------------- capabilities
     def capabilities(self) -> dict:
         am = self.env.unwrapped.action_manager
@@ -691,6 +939,8 @@ class IsaacOpenArmEnv:
             "camera": {"width": self.CAM_W, "height": self.CAM_H,
                        "name": self.camera_name,
                        "wrist": self.wrist_camera_name or None},
+            "recording": {"cameras": self.recordable_cameras(),
+                          "active": self._rec is not None},
             "control": {"pos_tol": self.pos_tol},
         }
 

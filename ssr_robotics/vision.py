@@ -91,6 +91,72 @@ def pixel_to_point_with_depth(u, v, depth, K, cam_pos, cam_rot):
     return cam_pos + cam_rot @ p_cam
 
 
+def look_at_quat_ros(eye, target, up=(0.0, 0.0, 1.0)):
+    """Quaternion (wxyz) of a camera at ``eye`` looking at ``target``, ROS/optical
+    convention (+X right, +Y down, +Z forward = view direction).
+
+    The inverse companion of ``cam_rot`` in :func:`pixel_to_table_point`: the
+    returned quaternion is what Isaac Lab's ``Camera.set_world_poses(...,
+    convention="ros")`` expects, and its rotation matrix maps camera-optical to
+    world. ``up`` is the world up used to level the image (zero roll). When the
+    view direction is parallel to ``up`` — e.g. a perfectly straight-down camera,
+    a legitimate config — the roll reference falls back to world +Y, reproducing
+    the canonical overhead convention (x→x, y→-y, z→-z) instead of failing.
+    Raises only if ``eye`` and ``target`` coincide (no view direction at all).
+    """
+    eye = np.asarray(eye, dtype=float)
+    target = np.asarray(target, dtype=float)
+    up = np.asarray(up, dtype=float)
+    fwd = target - eye
+    n = np.linalg.norm(fwd)
+    if n < 1e-9:
+        raise ValueError("look_at: eye and target coincide")
+    z = fwd / n                       # optical +Z: view direction
+    x = np.cross(z, up)               # optical +X: right = forward x up
+    nx = np.linalg.norm(x)
+    if nx < 1e-9:
+        # Vertical view: level the image against world +Y instead (and +X as the
+        # last resort if the caller's up itself was +Y).
+        for alt in ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0)):
+            x = np.cross(z, np.asarray(alt))
+            nx = np.linalg.norm(x)
+            if nx >= 1e-9:
+                break
+    x = x / nx
+    y = np.cross(z, x)                # optical +Y: down (right-handed: z x x = y)
+    r = np.stack([x, y, z], axis=1)   # world <- optical, columns are the axes
+    # Rotation matrix -> quaternion (wxyz), standard Shepperd branch selection.
+    t = np.trace(r)
+    if t > 0:
+        s = np.sqrt(t + 1.0) * 2.0
+        w, qx, qy, qz = (0.25 * s, (r[2, 1] - r[1, 2]) / s,
+                         (r[0, 2] - r[2, 0]) / s, (r[1, 0] - r[0, 1]) / s)
+    elif r[0, 0] > r[1, 1] and r[0, 0] > r[2, 2]:
+        s = np.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2]) * 2.0
+        w, qx, qy, qz = ((r[2, 1] - r[1, 2]) / s, 0.25 * s,
+                         (r[0, 1] + r[1, 0]) / s, (r[0, 2] + r[2, 0]) / s)
+    elif r[1, 1] > r[2, 2]:
+        s = np.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2]) * 2.0
+        w, qx, qy, qz = ((r[0, 2] - r[2, 0]) / s, (r[0, 1] + r[1, 0]) / s,
+                         0.25 * s, (r[1, 2] + r[2, 1]) / s)
+    else:
+        s = np.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1]) * 2.0
+        w, qx, qy, qz = ((r[1, 0] - r[0, 1]) / s, (r[0, 2] + r[2, 0]) / s,
+                         (r[1, 2] + r[2, 1]) / s, 0.25 * s)
+    q = np.array([w, qx, qy, qz])
+    return q / np.linalg.norm(q)
+
+
+def quat_wxyz_to_matrix(q):
+    """Rotation matrix (world <- optical) of a wxyz quaternion. Pure NumPy."""
+    w, x, y, z = np.asarray(q, dtype=float)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+
+
 def pixel_to_table_point(u, v, K, cam_pos, cam_rot, table_z):
     """Back-project pixel ``(u, v)`` onto the world plane ``z = table_z``.
 

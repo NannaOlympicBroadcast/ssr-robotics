@@ -59,3 +59,48 @@ def test_parse_obstacles_drops_malformed_entries():
 def test_parse_obstacles_blank_and_garbage_return_empty():
     for raw in ("", "   ", None, "not json", "{}", '{"aabb": [0,0,0,1,1,1]}'):
         assert E._parse_obstacles(raw) == []
+
+
+# ------------------------------------------------------------- vec3 parsing
+def test_parse_vec3_reads_comma_separated_floats():
+    assert E._parse_vec3("1.0, 0.8, 0.9") == (1.0, 0.8, 0.9)
+    assert E._parse_vec3("-1,2,3.5") == (-1.0, 2.0, 3.5)
+
+
+def test_parse_vec3_keep_sentinel_and_garbage_return_none():
+    for raw in (None, "", "   ", "keep", "KEEP", "a,b,c", "1,2", "1,2,3,4"):
+        assert E._parse_vec3(raw) is None
+
+
+# ------------------------------------------------------ debug-vis cfg clearing
+def test_disable_debug_vis_clears_flags_on_term_cfgs():
+    class Term:
+        def __init__(self, vis):
+            self.debug_vis = vis
+
+    class Group:
+        pass
+
+    class Cfg:
+        pass
+
+    cfg = Cfg()
+    cfg.actions = Group()
+    cfg.actions.arm = Term(True)          # the IK action's axis markers
+    cfg.actions.gripper = Term(False)     # already off — must not be counted
+    cfg.commands = Group()
+    cfg.commands.goal = Term(True)        # goal-pose frame markers
+    cfg.scene = Group()
+    cfg.scene.camera = object()           # no debug_vis attr — skipped
+
+    assert E._disable_debug_vis_cfg(cfg) == 2
+    assert cfg.actions.arm.debug_vis is False
+    assert cfg.commands.goal.debug_vis is False
+    assert cfg.actions.gripper.debug_vis is False
+
+
+def test_disable_debug_vis_handles_missing_groups():
+    class Cfg:
+        pass
+
+    assert E._disable_debug_vis_cfg(Cfg()) == 0

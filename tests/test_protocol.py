@@ -152,3 +152,50 @@ def test_env_only_touched_from_pump_thread():
 
     assert call_thread_ids == [pump_thread_id["id"]]
     assert pump_thread_id["id"] != publish_thread_id
+
+
+def test_runner_serves_record_start_and_stop():
+    """Recording rides the same job queue as skills, so 'start recording, then
+    execute' runs in order on the sim thread; stop returns the encoded video on
+    arm.record.saved for the brain to save and review."""
+    bus = MessageBus(name="t", source="t")
+    env = _StubEnv()
+    env.recording = None
+    env.start_recording = lambda camera="", every=None, max_frames=None: (
+        setattr(env, "recording", camera or "tiled_camera"),
+        {"ok": True, "camera": camera or "tiled_camera"})[1]
+    env.stop_recording = lambda: {"ok": True, "camera": env.recording, "format": "gif",
+                                  "fps": 10, "frames": 42, "dropped": 0,
+                                  "video_b64": base64.b64encode(b"GIF89a").decode()}
+    runner = EnvRunner(bus, env).start()
+
+    started, saved = {}, {}
+    ev_started, ev_saved = threading.Event(), threading.Event()
+    bus.subscribe(P.TOPIC_RECORD_STARTED, lambda ev: (started.update(ev.payload), ev_started.set()))
+    bus.subscribe(P.TOPIC_RECORD_SAVED, lambda ev: (saved.update(ev.payload), ev_saved.set()))
+
+    bus.publish(P.TOPIC_RECORD_START, {"camera": "tiled_camera"})
+    assert runner.pump(timeout=2.0)
+    assert ev_started.wait(2.0) and started["ok"] is True
+
+    bus.publish(P.TOPIC_RECORD_STOP, {})
+    assert runner.pump(timeout=2.0)
+    assert ev_saved.wait(2.0)
+    runner.stop()
+    assert saved["ok"] is True and saved["frames"] == 42
+    assert base64.b64decode(saved["video_b64"]) == b"GIF89a"
+
+
+def test_runner_record_stop_without_env_support_reports_error():
+    """A stub/old env without recording must produce a loud error event, not a
+    silent hang on the brain side waiting for arm.record.saved."""
+    bus = MessageBus(name="t", source="t")
+    runner = EnvRunner(bus, _StubEnv()).start()  # _StubEnv has no stop_recording
+    saved = {}
+    done = threading.Event()
+    bus.subscribe(P.TOPIC_RECORD_SAVED, lambda ev: (saved.update(ev.payload), done.set()))
+    bus.publish(P.TOPIC_RECORD_STOP, {})
+    assert runner.pump(timeout=2.0)
+    assert done.wait(2.0)
+    runner.stop()
+    assert saved["ok"] is False and saved.get("error")

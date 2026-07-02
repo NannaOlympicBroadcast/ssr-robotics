@@ -96,3 +96,59 @@ def test_pixel_to_table_point_ray_parallel_returns_none():
     cam_pos = np.array([0.0, 0.0, 1.0])
     cam_rot = np.array([[0, 0, 1.0], [0, 1.0, 0], [-1.0, 0, 0]])  # principal ray horizontal
     assert V.pixel_to_table_point(160.0, 120.0, K, cam_pos, cam_rot, table_z=0.0) is None
+
+
+def test_look_at_quat_ros_straight_down_matches_overhead_convention():
+    # A camera looking straight down should reproduce the canonical overhead
+    # rotation used throughout these tests: x->x, y->-y, z->-z.
+    q = V.look_at_quat_ros(eye=[0.4, 0.1, 1.0], target=[0.4, 0.1, 0.0], up=(0, 1, 0))
+    R = V.quat_wxyz_to_matrix(q)
+    assert np.allclose(R @ [0, 0, 1], [0, 0, -1], atol=1e-9)  # forward = world -z
+
+
+def test_look_at_quat_ros_points_optical_z_at_target():
+    eye = np.array([1.0, 0.8, 0.9])
+    target = np.array([0.4, 0.0, 0.05])
+    q = V.look_at_quat_ros(eye, target)
+    R = V.quat_wxyz_to_matrix(q)
+    fwd = R @ [0, 0, 1]  # optical +Z in world
+    expect = (target - eye) / np.linalg.norm(target - eye)
+    assert np.allclose(fwd, expect, atol=1e-9)
+    # Zero roll: optical +X (image right) is horizontal (no world-z component).
+    right = R @ [1, 0, 0]
+    assert math.isclose(right[2], 0.0, abs_tol=1e-9)
+    # Optical +Y (image down) has a downward world component (elevated camera).
+    down = R @ [0, 1, 0]
+    assert down[2] < 0
+
+
+def test_look_at_round_trips_through_pixel_back_projection():
+    # A pixel through the principal point of a look-at camera must back-project
+    # exactly onto the look-at target — the two functions are inverses.
+    eye, target = [1.0, 0.8, 0.9], [0.4, 0.0, 0.05]
+    q = V.look_at_quat_ros(eye, target)
+    R = V.quat_wxyz_to_matrix(q)
+    K = np.array([[200.0, 0, 160.0], [0, 200.0, 120.0], [0, 0, 1.0]])
+    p = V.pixel_to_table_point(160.0, 120.0, K, eye, R, table_z=0.05)
+    assert p is not None and np.allclose(p, target, atol=1e-9)
+
+
+def test_look_at_quat_ros_rejects_coincident_eye_and_target():
+    import pytest
+
+    with pytest.raises(ValueError):
+        V.look_at_quat_ros([0, 0, 1], [0, 0, 1])          # eye == target
+
+
+def test_look_at_quat_ros_straight_down_with_default_up_falls_back():
+    # View parallel to the default up (a straight-down camera — a legitimate
+    # SSR_ARM_CAM_POS config) must not raise: the roll reference falls back to
+    # world +Y, giving the canonical overhead convention (x->x, y->-y, z->-z),
+    # so _position_camera applies the pose instead of silently keeping the old one.
+    q = V.look_at_quat_ros([0.4, 0.1, 1.0], [0.4, 0.1, 0.0])  # default up=(0,0,1)
+    R = V.quat_wxyz_to_matrix(q)
+    assert np.allclose(R, [[1, 0, 0], [0, -1, 0], [0, 0, -1]], atol=1e-9)
+    # And straight UP (parallel the other way) also resolves without raising.
+    q_up = V.look_at_quat_ros([0, 0, 0], [0, 0, 1])
+    Ru = V.quat_wxyz_to_matrix(q_up)
+    assert np.allclose(Ru @ [0, 0, 1], [0, 0, 1], atol=1e-9)
