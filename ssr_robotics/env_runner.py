@@ -8,13 +8,19 @@ in-process :class:`ssr.bus.core.MessageBus` and the remote
 * answers ``arm.capabilities.request`` with the env's advertised capabilities
   (so the agent discovers the supported action types / skills at runtime);
 * serves ``arm.action.execute`` by invoking the requested skill on the env, then
-  publishes a completion event (``arm.grasp.completed`` for grasping skills,
-  else ``arm.action.completed``) carrying the result + scene snapshot + camera
-  frame.
+  publishes an ``arm.action.completed`` event carrying the result + scene
+  snapshot + camera frame;
+* serves ``arm.stream.start`` / ``arm.stream.stop`` from the cerebellum by
+  pushing the camera as a live RTSP stream (see :mod:`ssr_robotics.streamer`)
+  to the configured push address (``--stream-url`` / ``SSR_ARM_STREAM_URL``),
+  confirming with ``arm.stream.started`` / ``arm.stream.stopped``. The owner of
+  the sim thread must call :meth:`EnvRunner.stream_tick` in its main loop to
+  feed frames at the configured fps.
 
 The env must implement: ``reset()``, ``execute(req) -> dict``,
-``metrics() -> dict``, ``capabilities() -> dict``, ``frame() -> bytes`` and the
-``CAM_W`` / ``CAM_H`` attributes (see :class:`~ssr_robotics.isaac_env.IsaacOpenArmEnv`).
+``metrics() -> dict``, ``capabilities() -> dict``, ``frame() -> bytes``,
+``frame_rgb() -> bytes`` and the ``CAM_W`` / ``CAM_H`` attributes (see
+:class:`~ssr_robotics.isaac_env.IsaacOpenArmEnv`).
 
 Bus events normally arrive on a background thread (the remote
 :class:`ssr.bus.client.BusClient` pumps callbacks from its own asyncio loop
@@ -30,21 +36,31 @@ bus responsive), and the owner of ``simulation_app`` drains the queue by calling
 from __future__ import annotations
 
 import base64
+import os
 import queue
 import traceback
 from typing import Callable
 
 from . import protocol as P
 
-# Skills whose completion is reported on the grasp topic (vs the generic one).
-_GRASPING = {"pick"}
-
 
 class EnvRunner:
-    def __init__(self, bus, env, source: str = "openarm-env"):
+    def __init__(self, bus, env, source: str = "openarm-env",
+                 stream_url: str | None = None, stream_fps: float | None = None):
         self.bus = bus
         self.env = env
         self.source = source
+        # Where the camera RTSP stream is pushed when the cerebellum asks for it
+        # (arm.stream.start). Constructor arg wins, else SSR_ARM_STREAM_URL.
+        self.stream_url = (stream_url if stream_url is not None
+                           else os.environ.get("SSR_ARM_STREAM_URL", "")).strip()
+        raw_fps = os.environ.get("SSR_ARM_STREAM_FPS", "")
+        try:
+            env_fps = float(raw_fps) if raw_fps.strip() else 4.0
+        except ValueError:
+            env_fps = 4.0
+        self.stream_fps = env_fps if stream_fps is None else float(stream_fps)
+        self._streamer = None
         self._subs: list = []
         self._jobs: "queue.Queue[Callable[[], None]]" = queue.Queue()
 
@@ -53,6 +69,8 @@ class EnvRunner:
         self._subs.append(self.bus.subscribe(P.TOPIC_ACTION_EXECUTE, self._on_execute))
         self._subs.append(self.bus.subscribe(P.TOPIC_RESET, self._on_reset))
         self._subs.append(self.bus.subscribe(P.TOPIC_STATE_REQUEST, self._on_state_request))
+        self._subs.append(self.bus.subscribe(P.TOPIC_STREAM_START, self._on_stream_start))
+        self._subs.append(self.bus.subscribe(P.TOPIC_STREAM_STOP, self._on_stream_stop))
         # Advertise capabilities once on startup too. start() is called from the
         # main/sim thread before the event loop begins, so this direct call is safe.
         self._publish_caps()
@@ -65,6 +83,7 @@ class EnvRunner:
             except Exception:
                 pass
         self._subs.clear()
+        self._stop_streamer()
 
     def pump(self, timeout: float = 0.0) -> bool:
         """Run at most one queued env job. Call this from the thread that owns
@@ -180,11 +199,79 @@ class EnvRunner:
                   f"seq={req.seq_id} ok={result.get('ok')} error={result.get('error')!r}")
             payload = {"seq_id": req.seq_id, "episode": req.episode,
                        "status": "settled", **result, **frame}
-            topic = (P.TOPIC_GRASP_COMPLETED if req.command in _GRASPING
-                     else P.TOPIC_ACTION_COMPLETED)
-            self._publish(topic, payload)
+            self._publish(P.TOPIC_ACTION_COMPLETED, payload)
 
         self._jobs.put(_job)
+
+    # ------------------------------------------------------- camera streaming
+    # The cerebellum's grasp loop needs the live camera as an RTSP stream the
+    # VLX platform can pull. Stream start/stop are bus-triggered; the actual
+    # frame capture happens in stream_tick() on the sim thread.
+    def _on_stream_start(self, ev) -> None:
+        seq_id = (ev.payload or {}).get("seq_id", "")
+
+        def _job() -> None:
+            if not self.stream_url:
+                self._publish(P.TOPIC_STREAM_STARTED, {
+                    "seq_id": seq_id, "ok": False,
+                    "error": "no RTSP push URL configured on the bridge "
+                             "(--stream-url / SSR_ARM_STREAM_URL)"})
+                return
+            try:
+                if self._streamer is None or not self._streamer.active:
+                    from .streamer import RtspStreamer
+
+                    self._streamer = RtspStreamer(
+                        self.stream_url, self.env.CAM_W, self.env.CAM_H,
+                        fps=self.stream_fps).start()
+                # Prime the encoder with the current frame right away so the
+                # stream is immediately pullable.
+                self._streamer.push(self.env.frame_rgb())
+                print(f"[env_runner] camera stream -> {self.stream_url} "
+                      f"({self.env.CAM_W}x{self.env.CAM_H}@{self.stream_fps:g}fps)")
+                self._publish(P.TOPIC_STREAM_STARTED, {
+                    "seq_id": seq_id, "ok": True, "url": self.stream_url,
+                    "fps": self.stream_fps})
+            except Exception as e:
+                self._log_exc("stream start")
+                self._stop_streamer()
+                self._publish(P.TOPIC_STREAM_STARTED, {
+                    "seq_id": seq_id, "ok": False, "error": str(e)})
+
+        self._jobs.put(_job)
+
+    def _on_stream_stop(self, ev) -> None:
+        seq_id = (ev.payload or {}).get("seq_id", "")
+
+        def _job() -> None:
+            self._stop_streamer()
+            print("[env_runner] camera stream stopped")
+            self._publish(P.TOPIC_STREAM_STOPPED, {"seq_id": seq_id, "ok": True})
+
+        self._jobs.put(_job)
+
+    def _stop_streamer(self) -> None:
+        streamer, self._streamer = self._streamer, None
+        if streamer is not None:
+            try:
+                streamer.stop()
+            except Exception:
+                pass
+
+    def stream_tick(self) -> None:
+        """Push the next camera frame if streaming is active and due.
+
+        MUST be called from the thread that owns ``simulation_app`` (the same
+        one that calls :meth:`pump`) — the camera buffer is only safe to read
+        there. Cheap when idle: a monotonic-clock check and nothing else."""
+        streamer = self._streamer
+        if streamer is None or not streamer.due():
+            return
+        try:
+            streamer.push(self.env.frame_rgb())
+        except Exception:
+            self._log_exc("stream frame push")
+            self._stop_streamer()
 
 
 def connect_remote(url: str, source: str = "openarm-env", api_key: str | None = None):
