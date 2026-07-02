@@ -102,14 +102,16 @@ POS_TOL = 0.01
 # via SSR_ARM_WRIST_CAMERA to enable a local close-range grasp refinement pass.
 CAMERA_NAME = "tiled_camera"
 
-# Default main-camera pose: a front-side elevated view (relative to the robot's env
-# origin, world up), placed off the table's front corner and looking down at the
-# workspace so BOTH the arm and the whole tabletop are in frame — instead of the
-# scene's default straight-down overhead placement. Overridable via
-# SSR_ARM_CAM_POS / SSR_ARM_CAM_TARGET ("x,y,z"); set SSR_ARM_CAM_POS=keep to leave
-# the scene's own camera pose untouched.
-CAM_POS = (1.0, 0.8, 0.9)
-CAM_TARGET = (0.4, 0.0, 0.05)
+# Default main-camera pose (relative to the robot's env origin, world up): a
+# front-side view pulled well out beyond the table's front-left corner and kept
+# LOW, so it looks *across* the tabletop at a shallow, grazing angle (~22° above
+# the surface) rather than steeply down — this oblique overview keeps BOTH the arm
+# and the whole tabletop in frame. Move the eye further out / lower it to flatten
+# the angle more; raise it to steepen. Overridable via SSR_ARM_CAM_POS /
+# SSR_ARM_CAM_TARGET ("x,y,z"); set SSR_ARM_CAM_POS=keep to leave the scene's own
+# camera pose untouched.
+CAM_POS = (1.5, 1.0, 0.7)
+CAM_TARGET = (0.35, 0.0, 0.1)
 
 # Recording defaults: capture every Nth sim step, hard cap on buffered frames (a
 # 320x240 RGB frame is ~230 KB; 500 frames ≈ 35 s of a pick-and-place run).

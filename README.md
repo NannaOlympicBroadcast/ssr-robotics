@@ -64,10 +64,13 @@ vars, so no code edit is needed):
 * **Overhead camera too high / wrong angle.** Back-projecting 2-D pixels from a
   high, oblique view carries a large perspective error, so the arm grasps off to
   the side. The bridge now **repositions the main camera itself** at startup and
-  after every reset: a front-side elevated view (default position `1.0, 0.8, 0.9`
-  looking at `0.4, 0.0, 0.05`, relative to the robot's env origin) that frames the
-  arm and the whole tabletop. Tune with `SSR_ARM_CAM_POS` / `SSR_ARM_CAM_TARGET`
-  (`"x,y,z"`), or set `SSR_ARM_CAM_POS=keep` to leave the scene's own placement.
+  after every reset: a front-side view pulled out beyond the table's front-left
+  corner and kept low (default eye `1.5, 1.0, 0.7` looking at `0.35, 0.0, 0.1`,
+  relative to the robot's env origin) so it looks *across* the tabletop at a
+  shallow, grazing angle (~22° above the surface) and frames the arm and the whole
+  table. Move the eye further out / lower it to flatten the angle more, raise it to
+  steepen. Tune with `SSR_ARM_CAM_POS` / `SSR_ARM_CAM_TARGET` (`"x,y,z"`), or set
+  `SSR_ARM_CAM_POS=keep` to leave the scene's own placement.
   A different camera prim can be selected with `SSR_ARM_CAMERA=<prim_name>`
   (default `tiled_camera`). Depth-based back-projection is already preferred over
   the table-plane fallback.
